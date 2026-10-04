@@ -1751,9 +1751,11 @@ local function installAutoBuild()
         assert(character, "Wait for your character.")
         local tool = character:FindFirstChildOfClass("Tool")
         if kind~="place" then
+            local pickaxeNames={"woodPickaxe","stonePickaxe","diamondPickaxe","gildedSteelPickaxe",
+                "ironPickaxe","opalPickaxe","voidMattock"}
             local function usable(item)
                 return item:IsA("Tool") and (instant and item.Name=="gregsHammer"
-                    or not instant and (item.Name:lower():find("pickaxe",1,true)~=nil or item.Name=="gregsHammer"))
+                    or not instant and table.find(pickaxeNames,item.Name)~=nil)
             end
             if not tool or not usable(tool) then
                 tool=nil
