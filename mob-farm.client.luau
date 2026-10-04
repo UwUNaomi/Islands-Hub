@@ -1116,10 +1116,12 @@ local function installAutoBuild()
     local Counts = GhostPreview:AddParagraph({ Title = "Selection / Preview", Content = "No corners selected." })
     local GhostStatus = GhostPreview:AddParagraph({Title="Ghost Status",Content="Load a file to show its preview."})
     local FileStatus = BuildFiles:AddParagraph({Title="File Status",Content="Select a build file or save an island selection."})
+    local DestroyStatus
     local function status(message)
         build.lastStatus = tostring(message)
         trace("status", message)
         if state.running then Status:SetDesc(message); GhostStatus:SetDesc(message); FileStatus:SetDesc(message) end
+        if state.running and DestroyStatus then DestroyStatus:SetDesc(message) end
     end
     local objects = Instance.new("Folder")
     objects.Name = "RoSnipeBuildPreview"
@@ -1603,14 +1605,24 @@ local function installAutoBuild()
         local protos = getprotos or (debug and debug.getprotos)
         assert(getgc and info and constants, "Executor introspection APIs unavailable.")
         local lines = {"RoSnipe build diagnostic", "PlaceId="..game.PlaceId.." PlaceVersion="..game.PlaceVersion}
+        local character=LocalPlayer.Character
+        local equipped=character and character:FindFirstChildOfClass("Tool")
+        table.insert(lines,"Equipped tool="..(equipped and equipped.Name or "none"))
+        table.insert(lines,"Runtime="..HttpService:JSONEncode(debugBridge.snapshot()))
+        local selected,records=pcall(selectedBlocks)
+        table.insert(lines,selected and ("Selected real blocks="..#records) or ("Selection error="..tostring(records)))
+        local visited,dumped={},0
         local function dump(fn, label, depth)
+            if visited[fn] or dumped>=120 then return end
+            visited[fn]=true;dumped=dumped+1
             table.insert(lines,label)
             local ok, values = pcall(constants,fn)
             if ok and type(values)=="table" then
                 local keys={}
                 for key in pairs(values) do if type(key)=="number" then table.insert(keys,key) end end
                 table.sort(keys)
-                for _, key in ipairs(keys) do
+                for index, key in ipairs(keys) do
+                    if index>160 then table.insert(lines,"[remaining constants omitted]");break end
                     local value=values[key]
                     table.insert(lines,"constant["..key.."]="..(type(value)=="string" and string.format("%q",value) or "<"..type(value)..">"))
                 end
@@ -1627,7 +1639,7 @@ local function installAutoBuild()
                 local ok, details=pcall(info,fn)
                 local source=ok and type(details)=="table" and (details.source or details.short_src)
                 if type(source)=="string" and (source:find("controllers.block.block-controller",1,true)
-                    or source:find("pickaxe",1,true) or source:find("gregsHammer",1,true)) then
+                    or source:find("pickaxe",1,true) or source:find("axe-tool",1,true) or source:find("gregsHammer",1,true)) then
                     dump(fn,(details.name or "unnamed").." | "..source,0)
                 end
             end
@@ -1732,17 +1744,36 @@ local function installAutoBuild()
     end
     local function startJob(kind, records, instant, missingOnly)
         ensureIdle()
-        assert(#records>0 and #records<=MAX_BLOCKS, "Load a ghost preview or select 1–20000 blocks first.")
+        assert(#records>0 and #records<=MAX_BLOCKS, kind=="place" and "Load a ghost preview or select 1–20000 blocks first."
+            or "No real blocks selected. In Build Files, set both corners by clicking island blocks with the GUI hidden.")
         assert(not pendingRequest or pendingRequest.done, "Previous request is still pending.")
         local character, humanoid, root = getCharacter()
         assert(character, "Wait for your character.")
         local tool = character:FindFirstChildOfClass("Tool")
         if kind~="place" then
-            assert(tool,"Equip a pickaxe or Greg's Hammer.")
-            if instant then assert(tool.Name=="gregsHammer","Equip gregsHammer for instant destroy.") end
+            local function usable(item)
+                return item:IsA("Tool") and (instant and item.Name=="gregsHammer"
+                    or not instant and (item.Name:lower():find("pickaxe",1,true)~=nil or item.Name=="gregsHammer"))
+            end
+            if not tool or not usable(tool) then
+                tool=nil
+                local backpack=LocalPlayer:FindFirstChild("Backpack")
+                if backpack then
+                    for _,item in ipairs(backpack:GetChildren()) do
+                        if usable(item) then tool=item;break end
+                    end
+                end
+            end
+            assert(tool,instant and "Greg's Hammer was not found in your inventory. Use Destroy Blocks [Beta] with a pickaxe."
+                or "No pickaxe found in your character or Backpack. Put a pickaxe in your hotbar, then retry.")
         end
         if kind=="place" then rememberBuild(records) end
         stopFarms()
+        if kind~="place" then
+            if tool.Parent~=character then humanoid:EquipTool(tool) end
+            assert(tool.Parent==character,"Could not equip "..tool.Name..". Equip it manually and retry.")
+            status("Destroy starting: "..#records.." selected blocks | "..tool.Name.." | resolving block-hit hash...")
+        end
         build.busy, build.paused, build.mode = true, false, nil
         handles.Visible = false
         local token = build.version
@@ -1852,8 +1883,11 @@ local function installAutoBuild()
                             if not accepted then trace("placement rejected",record.name.."; will recheck on the next pass") end
                             renderBOM()
                         else
+                            assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
+                            status("Breaking "..index.." / "..#queue..": "..record.name.." | "..tool.Name)
                             for _=1,instant and 1 or 40 do
                                 if not waitReady() or not record.block.Parent then break end
+                                assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
                                 local sent,accepted=invoke(treeRemote,{[treeHashKey]=treeHashValue,part=record.part,block=record.block,
                                     norm=record.part.CFrame.UpVector,pos=record.part.Position},current,waitReady)
                                 if not sent then break end
@@ -1862,6 +1896,9 @@ local function installAutoBuild()
                                 task.wait(instant and 1/build.speed or 0.3)
                             end
                             if not record.block.Parent then confirmed=confirmed+1 end
+                            if current() and record.block.Parent then
+                                error("Block still present after repeated hits: "..record.name..". Hit it once manually with your pickaxe, then click Save Destroy Diagnostic.",0)
+                            end
                         end
                         if not build.paused then
                             status(report and ("Placed "..report.placed.." / "..report.total.." | "..report.phase.." "..record.name)
@@ -1896,13 +1933,18 @@ local function installAutoBuild()
                 elseif not current() then report.phase="Stopped";report.currentName=nil end
                 renderBOM()
             end
-            if not ok and state.running then trace("job error",err);status("Build error: "..tostring(err)) end
+            if not ok and state.running then
+                trace("job error",err);status((kind=="place" and "Build error: " or "Destroy error: ")..tostring(err))
+            end
         end)
     end
     local function action(section, title, fn)
         table.insert(build.actions, title)
         section:AddButton({Title=title, Callback=function()
             trace("button", title)
+            if title=="Destroy Blocks [Beta]" or title=="Instant Destroy Blocks (Greg's Hammer)" then
+                status("Checking destroy selection and pickaxe...")
+            end
             local ok, err=xpcall(fn, traceback)
             if not ok then trace("button error: "..title, err); status("Build error: "..tostring(err))
             else trace("callback returned", title) end
@@ -2171,8 +2213,10 @@ local function installAutoBuild()
     action(extras,"Move Ghost to Mouse",function() previewAnchor();arm("Move preview to mouse") end)
     local destroy=AutoBuild:AddSection("Block Destroyer")
     destroy:AddParagraph({Title="Selected Blocks",Content="Destroy acts on real blocks between the two selection corners."})
+    DestroyStatus=destroy:AddParagraph({Title="Destroy Status",Content="Set both corners in Build Files. A pickaxe in your Backpack will equip automatically."})
     action(destroy,"Destroy Blocks [Beta]",function() startJob("destroy",selectedBlocks(),false) end)
     action(destroy,"Instant Destroy Blocks (Greg's Hammer)",function() startJob("destroy",selectedBlocks(),true) end)
+    action(destroy,"Save Destroy Diagnostic",saveDiagnostic)
     redraw()
 
 end
