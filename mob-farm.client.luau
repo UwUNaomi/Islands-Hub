@@ -1,0 +1,2363 @@
+-- Combat and Cutting hub, based on the supplied NekoHub / Islands.God V4 source.
+-- Original authors: NtOpenProcess and soldo_io.
+-- Requires the same executor APIs and remote GUI library as the original.
+-- Combat and Cutting use remote requests with hash layouts verified from the live diagnostics.
+
+repeat task.wait() until game:IsLoaded()
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local LocalPlayer = Players.LocalPlayer
+local pastelPink = Color3.fromRGB(255, 209, 227)
+
+local Fluent = loadstring(game:HttpGet("https://raw.githubusercontent.com/IJHGIAJGIHJASUIJGHIUHIUHSUIAOHJAHOIBNAO/Nekohub/main/Fluent-master/main.lua"))()
+local Window = Fluent:CreateWindow({
+    Title = "RoSnipe",
+    SubTitle = "by Bingchilling",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(580, 460),
+    Acrylic = false,
+    Theme = "Light",
+    MinimizeKey = Enum.KeyCode.RightShift,
+})
+-- Fluent repaints its registered layers whenever controls are added. Use the
+-- unregistered outer frame for our color and make its decorative layers clear.
+local windowPaint = Window.AcrylicPaint.Frame
+windowPaint.BackgroundColor3 = pastelPink
+windowPaint.BackgroundTransparency = 0.1 -- 90% opacity
+for _, layer in ipairs(windowPaint:GetChildren()) do
+    if layer:IsA("Frame") then layer.BackgroundTransparency = 1 end
+end
+for _, layer in ipairs(windowPaint:GetDescendants()) do
+    if layer:IsA("ImageLabel") and layer.ScaleType == Enum.ScaleType.Tile then
+        layer.Image = ""
+    end
+end
+local Main = Window:AddTab({ Title = "Combat", Icon = "sword" })
+local Cutting = Window:AddTab({ Title = "Cutting", Icon = "axe" })
+local AutoBuild = Window:AddTab({ Title = "Autobuild", Icon = "building-2" })
+local GhostPreview = Window:AddTab({ Title = "Ghost Preview", Icon = "eye" })
+local BuildFiles = Window:AddTab({ Title = "Build Files", Icon = "folder" })
+local Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+
+local state = {
+    running = true,
+    autoFarm = false,
+    killAura = false,
+    rageblade = false,
+    weapon = nil,
+    selected = { slime = true },
+    height = -10,
+    speed = 25,
+    movement = "Tween",
+    target = nil,
+    auraRange = 20,
+    auraInterval = 0.4,
+    tokensPerKill = 5,
+    treeFarm = false,
+    treeAura = false,
+    treeType = "All",
+    treeRange = 12,
+    treeInterval = 0.5,
+    treeTarget = nil,
+}
+local connections = {}
+local combatRemote, combatKey, combatHash, combatWeapon
+local resolving = false
+local movementRoot, floatVelocity
+local collisions = {}
+local rageData, rageTool, oldRageSpeed, oldLastClicked
+local aux
+local farmToggle, auraToggle
+local treeFarmToggle, treeAuraToggle
+local stopCutting
+local stopAutoBuild
+local generation = 0
+local combatRequests = 0
+local activeCombatActivation
+local combatInput
+local windowFocused = true
+
+local function releaseCombatActivation(expected)
+    local activation = activeCombatActivation
+    if not activation or (expected and activation ~= expected) then return true end
+    local ok, err = pcall(function()
+        activation.input:SendMouseButton(activation.point, Enum.UserInputType.MouseButton1, false, 0)
+    end)
+    -- Roblox also throws when the button is already up (for example after a
+    -- physical release or loss of focus). That must not poison later clicks.
+    local stateKnown, buttonDown = pcall(function()
+        return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    end)
+    if ok or (stateKnown and not buttonDown) then
+        activeCombatActivation = nil
+        return true
+    else
+        warn("[RoSnipe] Could not release combat click: " .. tostring(err))
+    end
+    return false, tostring(err)
+end
+
+local Status = Main:AddParagraph({
+    Title = "Status",
+    Content = "Enable Mob Auto Farm, then hide this window with Right Shift to start automatic clicks.",
+})
+local AuraStatus = Main:AddParagraph({
+    Title = "Slime Aura Status",
+    Content = "Off",
+})
+local lastAuraStatus
+local ClickStatus = Main:AddParagraph({ Title = "Auto Click Status", Content = "Off" })
+local lastClickStatus
+local function setClickStatus(message)
+    if state.running and message ~= lastClickStatus then
+        lastClickStatus = message
+        ClickStatus:SetDesc(message)
+    end
+end
+
+local function setAuraStatus(message)
+    if state.running and message ~= lastAuraStatus then
+        lastAuraStatus = message
+        AuraStatus:SetDesc(message)
+    end
+end
+
+local function setStatus(message)
+    if state.running then
+        Status:SetDesc(message)
+    end
+end
+
+local function getCharacter()
+    local character = LocalPlayer.Character
+    if not character then return nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or not root then return nil end
+    return character, humanoid, root
+end
+
+local function restoreMovement()
+    if floatVelocity then
+        floatVelocity:Destroy()
+        floatVelocity = nil
+    end
+    for part, canCollide in pairs(collisions) do
+        if part.Parent then part.CanCollide = canCollide end
+    end
+    collisions = {}
+    movementRoot = nil
+end
+
+local function restoreRageblade()
+    if rageData then
+        rageData.speed = oldRageSpeed
+        rageData.lastClicked = oldLastClicked
+    end
+    rageData, rageTool = nil, nil
+end
+
+local function stopCombat()
+    generation = generation + 1
+    releaseCombatActivation()
+    state.target = nil
+    state.treeTarget = nil
+    restoreMovement()
+    restoreRageblade()
+end
+
+local function netManaged()
+    local current = ReplicatedStorage
+    for _, name in ipairs({ "rbxts_include", "node_modules", "@rbxts", "net", "out", "_NetManaged" }) do
+        current = current:FindFirstChild(name)
+        assert(current, "Missing game remote folder: " .. name)
+    end
+    return current
+end
+
+-- Preferred melee weapons first. Keep both wooden sword IDs: swordWood was
+-- verified in this inventory; woodenSword is the alternate user-provided ID.
+local meleeWeaponOrder = {
+    "cursedHammer", "reapersScythe", "divineDao", "captainsRapier",
+    "noxiousStinger", "stoneSword", "rageblade", "swordWood", "woodenSword",
+    "ironSword", "aquamarineSword", "rubySword", "frostSword", "cutlass",
+    "antlerDagger", "jollyDagger", "cactusSpike", "woodenMallet", "graniteHammer",
+    "gildedSteelHammer", "diamondWarHammer", "diamondGreatSword", "ironWarAxe",
+    "kongsAxe", "obsidianGreatsword", "dragonslayer", "antlerHammer",
+    "pumpkinHammer", "frostHammer", "infernalHammer", "serpentsBane", "troutsFury",
+}
+local meleeWeaponSet = {}
+for _, name in ipairs(meleeWeaponOrder) do meleeWeaponSet[name] = true end
+
+local function scanCombatInventory()
+    local found, equipped = {}, nil
+    local character = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local function scan(container, worn)
+        if not container then return end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and meleeWeaponSet[item.Name] then
+                if not found[item.Name] then found[item.Name] = item end
+                if worn and not equipped then equipped = item.Name end
+            end
+        end
+    end
+    scan(character, true)
+    scan(backpack, false)
+    local names = {}
+    for _, name in ipairs(meleeWeaponOrder) do
+        if found[name] then table.insert(names, name) end
+    end
+    return names, found, equipped
+end
+
+local function selectedCombatTool()
+    if not state.weapon then return nil end
+    local _, found = scanCombatInventory()
+    return found[state.weapon]
+end
+
+local function equipCombatWeapon()
+    local character, humanoid = getCharacter()
+    if not character then return nil end
+    local tool = selectedCombatTool()
+    if not tool then
+        local message = state.weapon and ("Waiting for " .. state.weapon .. " in your inventory.")
+            or "No melee weapon found. Add a weapon to your Backpack."
+        setStatus(message)
+        setAuraStatus(message)
+        return nil
+    end
+    if tool.Parent == character then return tool, false end
+    humanoid:EquipTool(tool)
+    if tool.Parent ~= character then return nil end
+    return tool, true
+end
+
+-- PlaceVersion 1246: the hit sender stores its hash in constants, not attemptHit upvalues.
+local function resolveCombat()
+    local info = getinfo or (debug and debug.getinfo)
+    local protos = getprotos or (debug and debug.getprotos)
+    local constants = getconstants or (debug and debug.getconstants)
+    assert(getgc and info and constants,
+        "Executor is missing the introspection APIs used by mob hash discovery.")
+    local net = netManaged()
+    local weapon = equipCombatWeapon()
+    assert(weapon, "Selected melee weapon is unavailable in your inventory.")
+    task.wait(0.2)
+    local function readHitSender(fn)
+        local ok, values = pcall(constants, fn)
+        if not ok or type(values) ~= "table" then return nil end
+        -- Verified sender layout: remote suffix, Get, hitUnit, HASH_KEY, HASH_VALUE,
+        -- argument table, CallServerAsync. Preserve the live hash string byte-for-byte.
+        if type(values[1]) ~= "string" or values[1] == "" or values[2] ~= "Get"
+            or values[3] ~= "hitUnit" or type(values[4]) ~= "string" or values[4] == ""
+            or type(values[5]) ~= "string" or values[5] == "" or values[7] ~= "CallServerAsync" then
+            return nil
+        end
+        local suffix = "/" .. values[1]
+        local matched
+        for _, remote in ipairs(net:GetChildren()) do
+            if remote:IsA("RemoteEvent") and (remote.Name == values[1] or remote.Name:sub(-#suffix) == suffix) then
+                if matched then return nil end -- Do not guess between ambiguous remote names.
+                matched = remote
+            end
+        end
+        if matched then return { remote = matched, key = values[4], hash = values[5] } end
+    end
+    local function inspectSender(fn, depth)
+        local match = readHitSender(fn)
+        if match then return match end
+        if depth >= 2 or type(protos) ~= "function" then return nil end
+        local ok, children = pcall(protos, fn)
+        if ok and type(children) == "table" then
+            for _, child in pairs(children) do
+                local nested = inspectSender(child, depth + 1)
+                if nested then return nested end
+            end
+        end
+    end
+    for _, closure in pairs(getgc(true)) do
+        if type(closure) == "function" then
+            local inspected, match = pcall(function()
+                local details = info(closure)
+                local source = type(details) == "table" and (details.source or details.short_src)
+                -- Both Backpack.swordWood.sword and Workspace.<player>.swordWood.sword
+                -- appeared in the report. Exclude our own executor functions.
+                if type(source) ~= "string" or not string.find(source, "." .. weapon.Name .. ".", 1, true) then
+                    return nil
+                end
+                return inspectSender(closure, details.name == "attemptHit" and 0 or 2)
+            end)
+            if inspected and match then
+                return match, weapon
+            end
+        end
+    end
+    error("No compatible melee hit sender found for " .. weapon.Name
+        .. ". Equip it, hit a slime manually, then refresh combat remotes; a weapon diagnostic may be needed.")
+end
+
+local function refreshCombat()
+    if resolving or not state.running then return end
+    resolving = true
+    stopCombat()
+    local token = generation
+    combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
+    setStatus("Resolving combat for " .. (state.weapon or "selected weapon") .. "...")
+    local ok, match, weapon = pcall(resolveCombat)
+    resolving = false
+    -- Selection, respawn, or disabling combat can invalidate an in-flight lookup.
+    if not state.running then return end
+    if token ~= generation then
+        if (state.autoFarm or state.killAura) and selectedCombatTool() then task.defer(refreshCombat) end
+        return
+    end
+    if ok and weapon == selectedCombatTool() then
+        combatRemote, combatKey, combatHash, combatWeapon = match.remote, match.key, match.hash, weapon
+        setStatus("Equipped " .. weapon.Name .. "; targeted hit sender resolved.")
+    elseif not ok then
+        setStatus(tostring(match))
+        setAuraStatus(tostring(match))
+        warn("[Mob Farm] " .. tostring(match))
+    end
+end
+
+local function findNearestMob(selectedOnly)
+    local _, _, root = getCharacter()
+    local island = workspace:FindFirstChild("WildernessIsland")
+    local entities = island and island:FindFirstChild("Entities")
+    if not root or not entities then return nil end
+    local nearest, distance = nil, math.huge
+    for _, mob in ipairs(entities:GetChildren()) do
+        local mobRoot = mob:FindFirstChild("HumanoidRootPart")
+        local humanoid = mob:FindFirstChildOfClass("Humanoid")
+        if mobRoot and humanoid and humanoid.Health > 0 and (not selectedOnly or state.selected[mob.Name]) then
+            local currentDistance = (mobRoot.Position - root.Position).Magnitude
+            if currentDistance < distance then
+                nearest, distance = mob, currentDistance
+            end
+        end
+    end
+    return nearest
+end
+
+local function auraMobRoot(mob)
+    local character, _, root = getCharacter()
+    local mobRoot = mob and mob.Parent and mob:FindFirstChild("HumanoidRootPart")
+    local humanoid = mob and mob:FindFirstChildOfClass("Humanoid")
+    if not character then return nil, "player unavailable" end
+    local name = mob and string.lower(mob.Name)
+    if name ~= "slime" and name ~= "slimes" then return nil, "name does not match" end
+    if not mobRoot then return nil, "missing HumanoidRootPart" end
+    if not humanoid then return nil, "missing Humanoid" end
+    if humanoid.Health <= 0 then return nil, "dead" end
+    if (mobRoot.Position - root.Position).Magnitude > state.auraRange then
+        return nil, "outside " .. state.auraRange .. " stud detection range"
+    end
+    return mobRoot
+end
+
+local function findAuraSlime()
+    local _, _, root = getCharacter()
+    local island = workspace:FindFirstChild("WildernessIsland")
+    local entities = island and island:FindFirstChild("Entities")
+    if not root then return nil, "Waiting for your character." end
+    if not entities then return nil, "WildernessIsland.Entities is not loaded." end
+    local nearest, distance = nil, math.huge
+    local reasons, names = {}, {}
+    for _, mob in ipairs(entities:GetChildren()) do
+        local mobRoot, reason = auraMobRoot(mob)
+        if mobRoot then
+            local current = (mobRoot.Position - root.Position).Magnitude
+            if current < distance then nearest, distance = mob, current end
+        elseif reason ~= "name does not match" then
+            reasons[reason] = (reasons[reason] or 0) + 1
+        end
+        names[mob.Name] = true
+    end
+    if nearest then return nearest end
+    local details = {}
+    for reason, count in pairs(reasons) do
+        table.insert(details, tostring(count) .. " " .. reason)
+    end
+    table.sort(details)
+    if #details > 0 then return nil, "No attackable slime: " .. table.concat(details, "; ") end
+    for name in pairs(names) do table.insert(details, name) end
+    table.sort(details)
+    return nil, "No slime/slimes models found. Entity names: " .. table.concat(details, ", ", 1, math.min(#details, 8))
+end
+
+local function prepareRageblade(character)
+    local tool = character:FindFirstChild("rageblade")
+    if not state.rageblade or state.weapon ~= "rageblade" or not tool then
+        restoreRageblade()
+        return
+    end
+    if rageTool == tool and rageData then return end
+    restoreRageblade()
+    if not aux then
+        aux = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/Upbolt/Hydroxide/revision/ohaux.lua"))()
+    end
+    local scriptPath = tool:FindFirstChild("rageblade")
+    assert(scriptPath, "Equipped rageblade is missing its client script.")
+    local closure = aux.searchClosure(scriptPath, "Unnamed function", 1, {
+        "isHitting", "getLivingEntityFromChildPart", "attemptHit",
+    })
+    local data = debug.getupvalue(closure, 1)
+    assert(type(data) == "table", "Could not locate the original rageblade state.")
+    rageData, rageTool = data, tool
+    oldRageSpeed, oldLastClicked = data.speed, data.lastClicked
+    data.speed = 4
+end
+
+local function hash()
+    return HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
+end
+
+local function combatClickPause()
+    if not windowFocused then return "Paused: focus the Roblox window." end
+    if GuiService.MenuIsOpen or UserInputService:GetFocusedTextBox() then
+        return "Paused while a menu or text box is open."
+    end
+    if not Window.Minimized then return "Hide RoSnipe with Right Shift to start automatic clicks." end
+    if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+        return "Release the left mouse button to resume automatic clicks."
+    end
+end
+
+-- Clicks start normal sword swings independently of the targeted hit loop.
+-- A delayed/rejected mouse-up must not suppress the known-working hit requests.
+local function runCombatClick()
+    local pause = combatClickPause()
+    if activeCombatActivation then
+        local released, releaseError = releaseCombatActivation()
+        if not released then error("Mouse release blocked: " .. tostring(releaseError), 0) end
+        pause = combatClickPause()
+    end
+    if pause then setClickStatus(pause) return end
+    local character = getCharacter()
+    if not character then return end
+    local mob = state.autoFarm and state.target or findAuraSlime()
+    if not mob or not mob.Parent then setClickStatus("Waiting for a mob.") return end
+    local health = mob:FindFirstChildOfClass("Humanoid")
+    if not health or health.Health <= 0 then return end
+    local tool = selectedCombatTool()
+    if not tool or tool ~= combatWeapon or tool.Parent ~= character or not tool.Enabled then return end
+    if not combatInput then
+        local ok, result = pcall(function() return UserInputService:CreateVirtualInput() end)
+        if not ok or not result then error("Combat auto-click unavailable: " .. tostring(result), 0) end
+        combatInput = result
+    end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local activation = { input = combatInput, point = camera.ViewportSize / 2 }
+    local token = generation
+    local activated, activateError = pcall(function()
+        combatInput:SendMouseButton(activation.point, Enum.UserInputType.MouseButton1, true, 0)
+    end)
+    if not activated then error("Combat click failed: " .. tostring(activateError), 0) end
+    activeCombatActivation = activation
+    task.wait(0.08)
+    local released, releaseError = releaseCombatActivation(activation)
+    if not released then error("Mouse release blocked: " .. tostring(releaseError), 0) end
+    if token == generation and state.running then setClickStatus("Automatic clicks: " .. tool.Name) end
+end
+
+local function attack(mob, farm)
+    local character = getCharacter()
+    if not character then return end
+    local token = generation
+    local tool, equippedNow = equipCombatWeapon()
+    if not tool or tool ~= combatWeapon then return end
+    if equippedNow then task.wait(0.2) end
+    if token ~= generation or not state.running or LocalPlayer.Character ~= character then return end
+    prepareRageblade(character)
+    if not state.running or token ~= generation then
+        restoreRageblade()
+        return
+    end
+    -- Original remote burst and payload; independent of Tool.Enabled and mouse state.
+    local boosted = state.rageblade and tool.Name == "rageblade"
+    local count = farm and (boosted and 50 or 5) or 1
+    if farm then task.wait(0.5) end
+    for _ = 1, count do
+        local humanoid = mob:FindFirstChildOfClass("Humanoid")
+        if not state.running or token ~= generation or resolving or not mob.Parent
+            or not humanoid or humanoid.Health <= 0 or not mob:FindFirstChild("HumanoidRootPart")
+            or LocalPlayer.Character ~= character or tool.Parent ~= character or tool ~= combatWeapon
+            or (farm and not state.autoFarm) or (not farm and not state.killAura) then
+            break
+        end
+        if not windowFocused or GuiService.MenuIsOpen or UserInputService:GetFocusedTextBox() then return end
+        combatRemote:FireServer(hash(), { { [combatKey] = combatHash, hitUnit = mob } })
+        combatRequests = combatRequests + 1
+        local root = character:FindFirstChild("HumanoidRootPart")
+        local distance = root and (root.Position - mob.HumanoidRootPart.Position).Magnitude or 0
+        local message = string.format("Hit request %d sent to %s | health %.1f | distance %.1f studs",
+            combatRequests, mob.Name, humanoid.Health, distance)
+        if farm then setStatus(message) else setAuraStatus(message) end
+        task.wait(farm and (boosted and 0 or 0.3) or 0.4)
+    end
+end
+
+-- Session kills inferred from positive slimeKingToken quantity changes.
+-- The GUI is optional; hiding it does not stop collection tracking.
+local tokenTracker = {
+    gained = 0,
+    previous = nil,
+    source = nil,
+    emptySince = nil,
+    rebaseUntil = 0,
+    message = "Reading token inventory...",
+}
+local quantityFields = { "Amount", "amount", "Quantity", "quantity", "Count", "count", "StackSize", "stackSize" }
+
+local function readTokenStack(item)
+    if item:IsA("IntValue") or item:IsA("NumberValue") then
+        return tonumber(item.Value)
+    end
+    for _, field in ipairs(quantityFields) do
+        local attribute = item:GetAttribute(field)
+        if tonumber(attribute) then return tonumber(attribute) end
+        local child = item:FindFirstChild(field)
+        if child and (child:IsA("IntValue") or child:IsA("NumberValue") or child:IsA("StringValue")) then
+            if tonumber(child.Value) then return tonumber(child.Value) end
+        end
+    end
+    -- Do not guess one token per Tool: a Tool may represent a large stack.
+    return nil
+end
+
+local function readTokenBalance()
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    local character = LocalPlayer.Character
+    if not backpack or not character then return nil, nil, "Waiting for inventory..." end
+    local total, found = 0, false
+    for _, container in ipairs({ backpack, character }) do
+        for _, item in ipairs(container:GetChildren()) do
+            if string.lower(item.Name) == "slimekingtoken" then
+                found = true
+                local amount = readTokenStack(item)
+                if not amount or amount < 0 or amount ~= amount or amount == math.huge then
+                    return nil, nil, "Token found; quantity field unavailable."
+                end
+                total = total + math.floor(amount)
+            end
+        end
+    end
+    if found then return total, "tools" end
+    -- Some versions expose a numeric inventory entry instead of a Backpack stack.
+    for _, name in ipairs({ "Inventory", "inventory" }) do
+        local inventory = LocalPlayer:FindFirstChild(name)
+        local item = inventory and inventory:FindFirstChild("slimeKingToken")
+        if item then
+            local amount = readTokenStack(item)
+            if amount and amount >= 0 and amount == amount and amount < math.huge then
+                return math.floor(amount), name
+            end
+            return nil, nil, "Inventory token found; quantity field unavailable."
+        end
+    end
+    return 0, tokenTracker.source or "tools"
+end
+
+local function sampleTokenBalance(amount, source, now)
+    if amount == nil then return end
+    -- Ignore brief removal while stacks move between Backpack and Character.
+    if amount == 0 and tokenTracker.previous and tokenTracker.previous > 0 then
+        tokenTracker.emptySince = tokenTracker.emptySince or now
+        if now - tokenTracker.emptySince < 0.75 then return end
+    else
+        tokenTracker.emptySince = nil
+    end
+    if tokenTracker.previous ~= nil and tokenTracker.source == source
+        and now >= tokenTracker.rebaseUntil then
+        tokenTracker.gained = tokenTracker.gained + math.max(0, amount - tokenTracker.previous)
+    end
+    tokenTracker.previous = amount
+    tokenTracker.source = source
+end
+
+local KillGui = Instance.new("ScreenGui")
+KillGui.Name = "IslandsSlimeKillCounter"
+KillGui.ResetOnSpawn = false
+KillGui.Enabled = false
+KillGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+local KillPanel = Instance.new("Frame")
+KillPanel.AnchorPoint = Vector2.new(1, 0)
+KillPanel.Position = UDim2.new(1, -20, 0, 20)
+KillPanel.Size = UDim2.fromOffset(190, 88)
+KillPanel.BackgroundColor3 = pastelPink
+KillPanel.BackgroundTransparency = 0.1 -- 90% opacity
+KillPanel.BorderSizePixel = 0
+KillPanel.Active = false
+KillPanel.Parent = KillGui
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = KillPanel
+local KillLabel = Instance.new("TextLabel")
+KillLabel.BackgroundTransparency = 1
+KillLabel.Position = UDim2.fromOffset(12, 8)
+KillLabel.Size = UDim2.new(1, -24, 0, 42)
+KillLabel.Font = Enum.Font.GothamBold
+KillLabel.TextSize = 26
+KillLabel.TextColor3 = Color3.fromRGB(75, 45, 62)
+KillLabel.TextXAlignment = Enum.TextXAlignment.Left
+KillLabel.Text = "Kills: 0"
+KillLabel.Parent = KillPanel
+local KillDetail = Instance.new("TextLabel")
+KillDetail.BackgroundTransparency = 1
+KillDetail.Position = UDim2.fromOffset(12, 50)
+KillDetail.Size = UDim2.new(1, -24, 0, 30)
+KillDetail.Font = Enum.Font.Gotham
+KillDetail.TextSize = 11
+KillDetail.TextWrapped = true
+KillDetail.TextColor3 = Color3.fromRGB(113, 78, 96)
+KillDetail.TextXAlignment = Enum.TextXAlignment.Left
+KillDetail.Parent = KillPanel
+
+local colorOptions = {
+    Black = { color = Color3.fromRGB(20, 20, 24), theme = "Dark" },
+    White = { color = Color3.fromRGB(255, 255, 255), theme = "Light" },
+    Pink = { color = pastelPink, theme = "Light" },
+    ["Pastel Blue"] = { color = Color3.fromRGB(190, 220, 255), theme = "Light" },
+}
+local selectedColor = "Pink"
+local function applyUIColor(name)
+    local palette = colorOptions[name]
+    if not palette then return end
+    selectedColor = name
+    Fluent:SetTheme(palette.theme)
+    windowPaint.BackgroundColor3 = palette.color
+    KillPanel.BackgroundColor3 = palette.color
+    local dark = palette.theme == "Dark"
+    KillLabel.TextColor3 = dark and Color3.fromRGB(245, 245, 250) or Color3.fromRGB(40, 35, 45)
+    KillDetail.TextColor3 = dark and Color3.fromRGB(210, 210, 220) or Color3.fromRGB(80, 70, 90)
+end
+local Appearance = Settings:AddSection("Appearance")
+local colorDropdown = Appearance:AddDropdown("UIColor", {
+    Title = "UI Color",
+    Values = { "Black", "White", "Pink", "Pastel Blue" },
+    Multi = false,
+    Default = "Pink",
+})
+colorDropdown:OnChanged(applyUIColor)
+
+local CounterSection = Settings:AddSection("Kill Counter")
+local CounterStatus = CounterSection:AddParagraph({
+    Title = "Token Tracking",
+    Content = "5 slimeKingToken gained = 1 kill. Existing tokens are excluded.",
+})
+local lastCounterMessage
+local function updateKillDisplay()
+    KillLabel.Text = "Kills: " .. math.floor(tokenTracker.gained / state.tokensPerKill)
+    KillDetail.Text = tokenTracker.message == "Tracking" and "Session kills from slime tokens" or tokenTracker.message
+    local message = tokenTracker.message .. " | " .. tokenTracker.gained .. " tokens gained | "
+        .. state.tokensPerKill .. " tokens per kill"
+    if message ~= lastCounterMessage then
+        lastCounterMessage = message
+        CounterStatus:SetDesc(message)
+    end
+end
+local showCounter = CounterSection:AddToggle("ShowKillCounter", { Title = "Show Simple Kill GUI", Default = false })
+showCounter:OnChanged(function(value) KillGui.Enabled = value end)
+CounterSection:AddInput("TokensPerKill", {
+    Title = "Tokens per Kill", Default = "5", Numeric = true, Finished = true,
+    Callback = function(value)
+        local amount = tonumber(value)
+        if amount and amount >= 1 and amount < math.huge and amount == math.floor(amount) then
+            state.tokensPerKill = amount
+            updateKillDisplay()
+        end
+    end,
+})
+CounterSection:AddButton({
+    Title = "Reset Kill Counter",
+    Callback = function()
+        tokenTracker.gained = 0
+        tokenTracker.previous, tokenTracker.source = readTokenBalance()
+        tokenTracker.emptySince = nil
+        updateKillDisplay()
+    end,
+})
+
+local MobSection = Main:AddSection("Mob Auto Farm")
+local WeaponStatus = MobSection:AddParagraph({
+    Title = "Weapon Inventory",
+    Content = "Detecting melee weapons in your Backpack and equipped tools...",
+})
+local weaponDropdown = MobSection:AddDropdown("CombatWeapon", {
+    Title = "Melee Weapon",
+    Description = "Detected inventory; preferred weapons first. Refreshes automatically.",
+    Values = {}, Multi = false,
+})
+local updatingWeapons = false
+local inventorySignature, lastWeaponInstance, lastWeaponMessage
+local function invalidateWeapon()
+    stopCombat()
+    combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
+    if (state.autoFarm or state.killAura) and selectedCombatTool() then task.spawn(refreshCombat) end
+end
+local function refreshWeaponInventory()
+    local names, found, equipped = scanCombatInventory()
+    if not state.weapon and #names > 0 then state.weapon = equipped or names[1] end
+    local values = {}
+    for _, name in ipairs(names) do table.insert(values, name) end
+    -- Preserve the user's selection through respawn or temporarily missing tools.
+    -- Never silently switch to another weapon after the user has chosen one.
+    local chosen = state.weapon
+    if chosen and not found[chosen] then
+        chosen = chosen .. " (missing)"
+        table.insert(values, chosen)
+    end
+    local signature = table.concat(values, "|") .. ":" .. (chosen or "")
+    if signature ~= inventorySignature then
+        inventorySignature = signature
+        updatingWeapons = true
+        weaponDropdown:SetValues(values)
+        weaponDropdown:SetValue(chosen)
+        updatingWeapons = false
+    end
+    local selected = state.weapon and found[state.weapon] or nil
+    if selected ~= lastWeaponInstance then
+        lastWeaponInstance = selected
+        invalidateWeapon()
+    end
+    local message = selected and ("Selected: " .. selected.Name .. " | " .. #names .. " melee weapons detected.")
+        or (state.weapon and ("Waiting for " .. state.weapon .. ". Choose another available weapon if needed.")
+        or "No melee weapons found. Bows, spellbooks, arrows and shields are excluded from melee farming.")
+    if message ~= lastWeaponMessage then
+        lastWeaponMessage = message
+        WeaponStatus:SetDesc(message)
+    end
+end
+weaponDropdown:OnChanged(function(value)
+    if updatingWeapons or not value or not meleeWeaponSet[value] or value == state.weapon then return end
+    state.weapon = value
+    lastWeaponInstance = selectedCombatTool()
+    invalidateWeapon()
+    refreshWeaponInventory()
+end)
+MobSection:AddButton({ Title = "Refresh Weapon Inventory", Callback = refreshWeaponInventory })
+refreshWeaponInventory()
+task.spawn(function()
+    while state.running do
+        task.wait(1)
+        if state.running then refreshWeaponInventory() end
+    end
+end)
+
+local selection = MobSection:AddDropdown("SelectedMobs", {
+    Title = "Selected Mob",
+    Description = "Mob to Farm",
+    Values = { "wraithBoss", "slime", "buffalkor", "wizardLizard", "Skorpions", "magmaBlob", "magmaGolem", "skeletonPirate", "voidPup", "voidDog" },
+    Multi = true,
+    Default = { "slime" },
+})
+selection:OnChanged(function(options)
+    local selected = {}
+    for name, enabled in pairs(options) do
+        if enabled then
+            if name == "Skorpions" then
+                for _, skorp in ipairs({ "skorpRuby", "skorpGold", "skorpIron", "skorpSerpent" }) do
+                    selected[skorp] = true
+                end
+            else
+                selected[name] = true
+            end
+        end
+    end
+    state.selected = selected
+    stopCombat()
+end)
+MobSection:AddSlider("MobHeight", {
+    Title = "Teleport Position (Y)", Default = -10, Min = -15, Max = 15, Rounding = 0,
+    Callback = function(value) state.height = value end,
+})
+farmToggle = MobSection:AddToggle("MobAutoFarmToggle", { Title = "Mob Auto Farm", Default = false })
+farmToggle:OnChanged(function(value)
+    if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopCutting then stopCutting() end
+    state.autoFarm = value
+    stopCombat()
+    if value and not combatRemote then task.spawn(refreshCombat) end
+end)
+auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Auto Click + Remote)", Default = false })
+auraToggle:OnChanged(function(value)
+    if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopCutting then stopCutting() end
+    state.killAura = value
+    stopCombat()
+    setAuraStatus(value and ("Starting; equipping " .. (state.weapon or "selected weapon") .. "...") or "Off")
+    if value and not combatRemote then task.spawn(refreshCombat) end
+end)
+MobSection:AddSlider("SlimeAuraRange", {
+    Title = "Slime Aura Range", Default = 20, Min = 1, Max = 50, Rounding = 0,
+    Callback = function(value) state.auraRange = value end,
+})
+MobSection:AddSlider("SlimeAuraInterval", {
+    Title = "Slime Aura Hit Interval", Default = 0.4, Min = 0.1, Max = 2, Rounding = 2,
+    Callback = function(value) state.auraInterval = value end,
+})
+local rageToggle = MobSection:AddToggle("MobUseRagebladeToggle", {
+    Title = "Rageblade Speed Boost", Description = "Only applies when rageblade is selected.", Default = false,
+})
+rageToggle:OnChanged(function(value)
+    state.rageblade = value
+    stopCombat()
+    combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
+    if state.autoFarm or state.killAura then task.spawn(refreshCombat) end
+end)
+
+-- Cutting uses CLIENT_BLOCK_HIT_REQUEST with the current axe-tool hash layout.
+-- Axe detection and cancellation are retained from the integrated controls.
+local treePatterns = {
+    All = "^tree", Oak = "^tree%d+$", Birch = "^treeBirch%d*$",
+    Maple = "^treeMaple%d*$", Pine = "^treePine%d*$", Hickory = "^treeHickory%d*$",
+    Spirit = "^treeSpirit%d*$", CherryBlossom = "^treeCherryBlossom%d*$",
+    Apple = "^treeApple%d*$", Lemon = "^treeLemon%d*$",
+}
+local axeNames = { "diamondAxe", "gildedSteelAxe", "ironAxe", "opalAxe", "stoneAxe", "woodAxe" }
+local TreeStatus = Cutting:AddParagraph({
+    Title = "Cutting Status",
+    Content = "Choose a tree. Auto Farm moves to trees; Tree Aura chops nearby trees without moving.",
+})
+local lastTreeStatus
+local treeRemote, treeHashKey, treeHashValue
+local pendingTreeHit
+local function setTreeStatus(message)
+    if state.running and message ~= lastTreeStatus then
+        lastTreeStatus = message
+        TreeStatus:SetDesc(message)
+    end
+end
+
+local function treeMatches(tree)
+    return string.match(tree.Name, treePatterns[state.treeType]) ~= nil
+end
+
+local function validTreeTarget(target)
+    return target and target.tree.Parent == target.parent and target.parent:IsDescendantOf(workspace)
+        and target.trunk:IsDescendantOf(target.tree) and treeMatches(target.tree)
+end
+
+local function detectTreeAxe(character)
+    for _, item in ipairs(character:GetChildren()) do
+        if item:IsA("Tool") and table.find(axeNames, item.Name) then return item end
+    end
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, name in ipairs(axeNames) do
+            local item = backpack:FindFirstChild(name)
+            if item and item:IsA("Tool") then return item end
+        end
+    end
+end
+
+local function findTreeTarget(root)
+    if validTreeTarget(state.treeTarget) then
+        if state.treeFarm or (root.Position - state.treeTarget.trunk.Position).Magnitude <= state.treeRange then
+            return state.treeTarget
+        end
+    end
+    local islands = workspace:FindFirstChild("Islands")
+    if not islands then return nil end
+    local nearest, best = nil, state.treeFarm and math.huge or state.treeRange
+    -- Prefer your owned island; otherwise use the loaded islands, as the input script does.
+    local candidates = islands:GetChildren()
+    for _, island in ipairs(candidates) do
+        local owners = island:FindFirstChild("Owners")
+        if owners and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then
+            candidates = { island }
+            break
+        end
+    end
+    for _, island in ipairs(candidates) do
+        local blocks = island:FindFirstChild("Blocks")
+        if blocks then
+            for _, tree in ipairs(blocks:GetChildren()) do
+                local trunk = treeMatches(tree) and tree:FindFirstChild("trunk")
+                if trunk and trunk:IsA("BasePart") then
+                    local distance = (root.Position - trunk.Position).Magnitude
+                    if distance <= best then
+                        nearest, best = { tree = tree, trunk = trunk, parent = blocks }, distance
+                    end
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function resolveTreeCombat()
+    local info = getinfo or (debug and debug.getinfo)
+    local protos = getprotos or (debug and debug.getprotos)
+    local constants = getconstants or (debug and debug.getconstants)
+    assert(getgc and info and constants,
+        "Executor is missing the APIs used by tree hash discovery.")
+    local remote = netManaged():FindFirstChild("CLIENT_BLOCK_HIT_REQUEST")
+    assert(remote and remote:IsA("RemoteFunction"), "CLIENT_BLOCK_HIT_REQUEST RemoteFunction was not found.")
+    setTreeStatus("Resolving the current axe-tool tree-hit hash...")
+    local function readHash(fn)
+        local ok, values = pcall(constants, fn)
+        if not ok or type(values) ~= "table" then return end
+        if not table.find(values, "CLIENT_BLOCK_HIT_REQUEST")
+            or not table.find(values, "Get") or not table.find(values, "CallServer") then return end
+        -- Verified from the user's PlaceVersion 1246 diagnostic:
+        -- block, part, pos, norm, HASH_KEY, HASH_VALUE, <table>, CallServer.
+        -- Read the live string verbatim; it includes control characters and newlines.
+        for index, value in pairs(values) do
+            if type(index) == "number" and value == "norm"
+                and values[index - 3] == "block" and values[index - 2] == "part"
+                and values[index - 1] == "pos" then
+                local key, hashValue = values[index + 1], values[index + 2]
+                if type(key) == "string" and key ~= "" and type(hashValue) == "string" and hashValue ~= "" then
+                    return key, hashValue
+                end
+            end
+        end
+    end
+    for _, closure in pairs(getgc(true)) do
+        if type(closure) == "function" then
+            local ok, key, hashValue = pcall(function()
+                local details = info(closure)
+                local source = type(details) == "table" and (details.source or details.short_src)
+                if type(source) ~= "string" or not string.find(source, "TS.tool.tools.shared.axe-tool", 1, true) then
+                    return
+                end
+                -- Either the live unnamed sender or onBlockHit's nested prototype can match.
+                local directKey, directHash = readHash(closure)
+                if directKey then return directKey, directHash end
+                if details.name == "onBlockHit" and type(protos) == "function" then
+                    local read, children = pcall(protos, closure)
+                    if read and type(children) == "table" then
+                        for _, proto in pairs(children) do
+                            local childKey, childHash = readHash(proto)
+                            if childKey then return childKey, childHash end
+                        end
+                    end
+                end
+            end)
+            if ok and key and hashValue then
+                treeRemote, treeHashKey, treeHashValue = remote, key, hashValue
+                setTreeStatus("Tree-hit hash resolved from axe-tool.")
+                return
+            end
+        end
+    end
+    error("Current axe-tool hash not found. Equip an axe, hit a tree manually, then use Refresh Tree Hash and retry.")
+end
+
+local function runTreeOnce()
+    local character, humanoid, root = getCharacter()
+    if not character then setTreeStatus("Waiting for your character.") return end
+    local token = generation
+    local function current()
+        return state.running and generation == token and (state.treeFarm or state.treeAura)
+            and LocalPlayer.Character == character and humanoid.Health > 0
+    end
+    local axe = detectTreeAxe(character)
+    if not axe then
+        state.treeTarget = nil
+        restoreMovement()
+        setTreeStatus("No axe found. Put an axe in your Backpack.")
+        return
+    end
+    if axe.Parent ~= character then
+        humanoid:EquipTool(axe)
+        task.wait(0.4)
+    end
+    if not current() then return end
+    if axe.Parent ~= character or not axe.Enabled then setTreeStatus("Waiting for the axe to be ready.") return end
+    local target = findTreeTarget(root)
+    state.treeTarget = target
+    if not target then setTreeStatus("No " .. state.treeType .. " trees with a trunk found in range.") return end
+    if (root.Position - target.trunk.Position).Magnitude > state.treeRange then
+        setTreeStatus("Moving to " .. target.tree.Name .. " with " .. axe.Name .. ".")
+        return
+    end
+    if not treeRemote or not treeRemote.Parent then resolveTreeCombat() end
+    if not current() or not validTreeTarget(target) or axe.Parent ~= character then return end
+    if pendingTreeHit and not pendingTreeHit.done then
+        error("Previous tree hit is still waiting for the server. Wait before retrying.")
+    end
+    local payload = {
+        [treeHashKey] = treeHashValue,
+        part = target.trunk,
+        block = target.tree,
+        -- The source's Vector3.new(v.CFrame) is invalid; use a real surface normal.
+        norm = target.trunk.CFrame.UpVector,
+        pos = target.tree:IsA("BasePart") and target.tree.Position or target.trunk.Position,
+    }
+    local request = { done = false }
+    local remote = treeRemote
+    pendingTreeHit = request
+    setTreeStatus("Sending tree hit: " .. target.tree.Name .. " with " .. axe.Name .. ".")
+    task.spawn(function()
+        request.ok, request.result = pcall(function()
+            if not current() then return end
+            return remote:InvokeServer(payload)
+        end)
+        request.done = true
+    end)
+    local deadline = os.clock() + 5
+    while not request.done do
+        if not current() then return end
+        if os.clock() >= deadline then
+            error("Tree hit response timed out; no additional hits will be queued.")
+        end
+        task.wait(0.05)
+    end
+    pendingTreeHit = nil
+    if not current() then return end
+    if not request.ok then error(request.result, 0) end
+    if request.result == false then error("Server rejected the tree hit. Check reach and island permissions.") end
+
+end
+
+local TreeSection = Cutting:AddSection("Tree Farm")
+local treeSelection = TreeSection:AddDropdown("TreeType", {
+    Title = "Tree to Farm",
+    Values = { "All", "Oak", "Birch", "Maple", "Pine", "Hickory", "Spirit", "CherryBlossom", "Apple", "Lemon" },
+    Default = "All", Multi = false,
+})
+treeSelection:OnChanged(function(value)
+    state.treeType = value
+    stopCombat()
+end)
+TreeSection:AddSlider("TreeRange", {
+    Title = "Tree Cutting Range", Default = 12, Min = 7, Max = 30, Rounding = 0,
+    Callback = function(value) state.treeRange = value end,
+})
+TreeSection:AddSlider("TreeHitInterval", {
+    Title = "Tree Hit Interval", Default = 0.5, Min = 0.1, Max = 2, Rounding = 2,
+    Callback = function(value) state.treeInterval = value end,
+})
+treeFarmToggle = TreeSection:AddToggle("TreeAutoFarm", { Title = "Tree Auto Farm", Default = false })
+treeAuraToggle = TreeSection:AddToggle("TreeAura", { Title = "Tree Aura (No Movement)", Default = false })
+stopCutting = function()
+    state.treeFarm, state.treeAura = false, false
+    if treeFarmToggle.Value then treeFarmToggle:SetValue(false) end
+    if treeAuraToggle.Value then treeAuraToggle:SetValue(false) end
+    stopCombat()
+    setTreeStatus("Off")
+end
+local function setCuttingMode(mode, value)
+    if value and stopAutoBuild then stopAutoBuild("Stopped: cutting enabled.") end
+    state[mode] = value
+    stopCombat()
+    if not value then
+        if not state.treeFarm and not state.treeAura then setTreeStatus("Off") end
+        return
+    end
+    if mode == "treeFarm" then
+        treeAuraToggle:SetValue(false)
+    else
+        treeFarmToggle:SetValue(false)
+    end
+    farmToggle:SetValue(false)
+    auraToggle:SetValue(false)
+    setTreeStatus("Scanning for " .. state.treeType .. " trees; axe detection is automatic.")
+end
+treeFarmToggle:OnChanged(function(value) setCuttingMode("treeFarm", value) end)
+treeAuraToggle:OnChanged(function(value) setCuttingMode("treeAura", value) end)
+TreeSection:AddButton({
+    Title = "Refresh Tree Hash",
+    Callback = function()
+        stopCutting()
+        treeRemote, treeHashKey, treeHashValue = nil, nil, nil
+        setTreeStatus("Tree hash cleared. Enable Tree Auto Farm or Tree Aura to resolve it again.")
+    end,
+})
+
+local Movement = Settings:AddSection("Farm Movement")
+local method = Movement:AddDropdown("TeleportMethod", {
+    Title = "Teleport Method", Values = { "Tween", "Instant" }, Default = "Tween", Multi = false,
+})
+method:OnChanged(function(value)
+    state.movement = value
+    stopCombat()
+end)
+Movement:AddSlider("TweenFlySpeed", {
+    Title = "Movement Speed", Default = 25, Min = 1, Max = 100, Rounding = 0,
+    Callback = function(value) state.speed = value end,
+})
+Settings:AddButton({
+    Title = "Refresh Combat Remotes",
+    Callback = function() task.spawn(refreshCombat) end,
+})
+
+-- Auto Build: adapted from the original Block Printer, with local preview state.
+local function installAutoBuild()
+    local build = { speed = 5, teleport = true, moveNear = false, useRadius = false, radius = 85,
+        retryPasses = 4, showHUD = true, noclip = true, paused = false, saveName = "mybuild", collision = false, records = {},
+        version = 0, busy = false, mode = nil, file = "Template", folder = "RoSnipe/Schematica", loadNearPlayer = true, events = {}, actions = {} }
+    local function trace(kind, message)
+        table.insert(build.events, {time=os.clock(), kind=kind, message=tostring(message)})
+        if #build.events > 40 then table.remove(build.events, 1) end
+    end
+    local function traceback(err)
+        return debug and debug.traceback and debug.traceback(tostring(err), 2) or tostring(err)
+    end
+    local MAX_BLOCKS = 20000
+    local buildConnections = {}
+    local function connect(signal, fn)
+        local connection = signal:Connect(fn)
+        table.insert(buildConnections, connection)
+        return connection
+    end
+    local Status = AutoBuild:AddParagraph({ Title = "Build Status", Content = "Choose a file in Build Files, load and position it in Ghost Preview, then BUILD HERE." })
+    local Counts = GhostPreview:AddParagraph({ Title = "Selection / Preview", Content = "No corners selected." })
+    local GhostStatus = GhostPreview:AddParagraph({Title="Ghost Status",Content="Load a file to show its preview."})
+    local FileStatus = BuildFiles:AddParagraph({Title="File Status",Content="Select a build file or save an island selection."})
+    local function status(message)
+        build.lastStatus = tostring(message)
+        trace("status", message)
+        if state.running then Status:SetDesc(message); GhostStatus:SetDesc(message); FileStatus:SetDesc(message) end
+    end
+    local objects = Instance.new("Folder")
+    objects.Name = "RoSnipeBuildPreview"
+    objects.Parent = workspace
+    local preview = Instance.new("Model")
+    preview.Name = "Blocks"
+    preview.Parent = objects
+    local box = Instance.new("Part")
+    box.Name = "Selection"
+    box.Anchored, box.CanCollide, box.CanTouch, box.CanQuery = true, false, false, false
+    box.Transparency = 1
+    box.Size = Vector3.new(3, 3, 3)
+    box.Parent = objects
+    local outline = Instance.new("SelectionBox")
+    outline.Color3 = Color3.fromRGB(255, 140, 185)
+    outline.LineThickness = 0.04
+    outline.Parent = objects
+    local handles = Instance.new("Handles")
+    handles.Color3 = outline.Color3
+    handles.Visible = false
+    handles.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    local mouse = LocalPlayer:GetMouse()
+    local originalFilter = mouse.TargetFilter
+    local pendingRequest
+    local placeRemote, placeKey, placeHash
+    -- Read-only snapshot for rosnipe-diagnostic.client.luau. Never exposes an
+    -- action runner: diagnostics cannot place/destroy blocks or trigger buttons.
+    local debugEnvironment = type(getgenv)=="function" and getgenv() or _G
+    local debugBridge = { version = "auto-build-diagnostics-v1" }
+    debugBridge.snapshot = function()
+        local events, actions = {}, {}
+        for i, event in ipairs(build.events) do
+            events[i] = {time=event.time, kind=event.kind, message=event.message}
+        end
+        for i, title in ipairs(build.actions) do actions[i]=title end
+        return {
+            running=state.running, busy=build.busy, paused=build.paused, retryPasses=build.retryPasses, useRadius=build.useRadius, radius=build.radius,
+            showHUD=build.showHUD, noclip=build.noclip, hasLastBuild=build.lastBuild~=nil, mode=build.mode or "none", generation=build.version,
+            file=build.file, folder=build.folder, records=#build.records, status=build.lastStatus or "Ready",
+            first=tostring(build.first), last=tostring(build.last), targetIsland=build.blocks and build.blocks.Parent and build.blocks.Parent.Name or "none",
+            pendingRequest=pendingRequest and not pendingRequest.done or false,
+            placeRemote=placeRemote and placeRemote:GetFullName() or "unresolved", hashResolved=placeKey~=nil and placeHash~=nil,
+            handleMode=build.handleMode or "none", handlesVisible=handles.Visible, handlesAdornee=handles.Adornee and handles.Adornee:GetFullName() or "none",
+            minimized=Window.Minimized, speed=build.speed, teleport=build.teleport, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
+            actions=actions, events=events,
+        }
+    end
+    debugEnvironment.RoSnipeBuildDebug = debugBridge
+    local function finite(n) return type(n) == "number" and n == n and math.abs(n) < 1e8 end
+    local function snap(n) return math.floor(n / 3 + 0.5) * 3 end
+    local function snapVector(v) return Vector3.new(snap(v.X), snap(v.Y), snap(v.Z)) end
+    local function blockPart(block)
+        if block:IsA("BasePart") then return block end
+        local root = block:FindFirstChild("Root")
+        if root and root:IsA("BasePart") then return root end
+        if block:IsA("Model") and block.PrimaryPart then return block.PrimaryPart end
+        return block:FindFirstChildWhichIsA("BasePart", true)
+    end
+    local function ownBlocks()
+        if build.blocks and build.blocks:IsDescendantOf(workspace) then return build.blocks end
+        local islands = workspace:FindFirstChild("Islands")
+        if islands then
+            for _, island in ipairs(islands:GetChildren()) do
+                local owners = island:FindFirstChild("Owners")
+                local blocks = island:FindFirstChild("Blocks")
+                if blocks and owners and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then
+                    build.blocks = blocks
+                    return blocks
+                end
+            end
+        end
+        error("Select a block on the target island first.", 0)
+    end
+    -- A compact materials panel remains visible while the main window is hidden.
+    local bomGui = Instance.new("ScreenGui")
+    bomGui.Name, bomGui.ResetOnSpawn, bomGui.Enabled = "RoSnipeBuildBlocks", false, false
+    bomGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    local bomPanel = Instance.new("Frame")
+    bomPanel.AnchorPoint = Vector2.new(1, 0.5)
+    bomPanel.Position = UDim2.new(1, -20, 0.5, 0)
+    bomPanel.Size = UDim2.fromOffset(336, 390)
+    bomPanel.BorderSizePixel = 0
+    bomPanel.Parent = bomGui
+    local round = Instance.new("UICorner")
+    round.CornerRadius = UDim.new(0, 14)
+    round.Parent = bomPanel
+    local function bomCard(name, y, height)
+        local card = Instance.new("Frame")
+        card.Name = name
+        card.Position = UDim2.fromOffset(12, y)
+        card.Size = height
+        card.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        card.BorderSizePixel = 0
+        card.Parent = bomPanel
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = card
+        return card
+    end
+    local bomSummary = bomCard("SummaryCard", 48, UDim2.new(1, -24, 0, 120))
+    local bomMaterials = bomCard("MaterialsCard", 178, UDim2.new(1, -24, 1, -190))
+    local function bomLabel(parent, y, height, size)
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Position = UDim2.fromOffset(14, y)
+        label.Size = UDim2.new(1, -28, 0, height)
+        label.Font = Enum.Font.Gotham
+        label.TextSize = size
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextYAlignment = Enum.TextYAlignment.Top
+        label.TextWrapped = true
+        label.TextColor3 = Color3.fromRGB(53, 42, 49)
+        label.Parent = parent
+        return label
+    end
+    local bomTitle = bomLabel(bomPanel, 13, 24, 20)
+    bomTitle.Name = "Title"
+    bomTitle.Text, bomTitle.Font = "Blocks", Enum.Font.GothamBold
+    local bomProgress = bomLabel(bomSummary, 12, 24, 17)
+    bomProgress.Name = "Progress"
+    bomProgress.Font = Enum.Font.GothamBold
+    local bomCurrent = bomLabel(bomSummary, 42, 34, 13)
+    bomCurrent.Name = "Current"
+    local bomNote = bomLabel(bomSummary, 82, 30, 11)
+    bomNote.Name = "Note"
+    bomNote.TextColor3 = Color3.fromRGB(119, 103, 113)
+    local bomMaterialsTitle = bomLabel(bomMaterials, 12, 18, 11)
+    bomMaterialsTitle.Text = "MATERIALS"
+    bomMaterialsTitle.Font = Enum.Font.GothamBold
+    bomMaterialsTitle.TextColor3 = Color3.fromRGB(149, 83, 112)
+    local bomScroll = Instance.new("ScrollingFrame")
+    bomScroll.Position = UDim2.fromOffset(14, 38)
+    bomScroll.Size = UDim2.new(1, -28, 1, -50)
+    bomScroll.BackgroundTransparency, bomScroll.BorderSizePixel = 1, 0
+    bomScroll.ScrollBarThickness = 4
+    bomScroll.Parent = bomMaterials
+    local bomRows = Instance.new("TextLabel")
+    bomRows.Name = "Materials"
+    bomRows.BackgroundTransparency = 1
+    bomRows.Font, bomRows.TextSize = Enum.Font.Gotham, 13
+    bomRows.LineHeight = 1.6
+    bomRows.TextColor3 = Color3.fromRGB(53, 42, 49)
+    bomRows.TextXAlignment, bomRows.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
+    bomRows.Parent = bomScroll
+    local bomClose = Instance.new("TextButton")
+    bomClose.Text, bomClose.TextSize, bomClose.BackgroundTransparency = "×", 22, 1
+    bomClose.Size = UDim2.fromOffset(28, 28)
+    bomClose.Position = UDim2.new(1, -34, 0, 8)
+    bomClose.Parent = bomPanel
+    connect(bomClose.MouseButton1Click, function() bomGui.Enabled=false end)
+    local function paintBOM()
+        bomPanel.BackgroundColor3 = windowPaint.BackgroundColor3
+        bomPanel.BackgroundTransparency = windowPaint.BackgroundTransparency
+        bomScroll.ScrollBarImageColor3 = Color3.fromRGB(214, 148, 178)
+        for _, label in ipairs({bomTitle,bomClose}) do
+            label.TextColor3 = KillLabel.TextColor3
+        end
+    end
+    connect(windowPaint:GetPropertyChangedSignal("BackgroundColor3"), paintBOM)
+    connect(KillLabel:GetPropertyChangedSignal("TextColor3"), paintBOM)
+    paintBOM()
+    local function newBOM(records)
+        local report = {records=records, total=#records, placed=0, sent=0, byName={}, names={}, phase="Ready", existing=0}
+        for _, record in ipairs(records) do
+            local row = report.byName[record.name]
+            if not row then
+                row={total=0,placed=0}
+                report.byName[record.name]=row
+                table.insert(report.names,record.name)
+            end
+            row.total=row.total+1
+        end
+        table.sort(report.names)
+        return report
+    end
+    local function renderBOM()
+        local report=build.bom
+        if not report then
+            bomProgress.Text="No blocks selected"
+            bomCurrent.Text="Load/clone a build, or select corners and hold a block."
+            bomNote.Text=""
+            bomRows.Text=""
+            return
+        end
+        bomProgress.Text=report.started and ("Placed: "..report.placed.." / "..report.total) or ("Total: "..report.total.." blocks")
+        bomCurrent.Text=report.phase..(report.currentName and (": "..report.currentName) or "")
+        bomNote.Text=report.started and ("Verified in the island • "..report.sent.." requests sent"
+            ..(report.existing>0 and ("\nIncludes "..report.existing.." already present") or "")) or "Materials required"
+        local rows={}
+        for _, name in ipairs(report.names) do
+            local row=report.byName[name]
+            table.insert(rows,name.."  "..(report.started and (row.placed.." / "..row.total) or ("× "..row.total)))
+        end
+        bomRows.Text=table.concat(rows,"\n")
+        bomRows.Size=UDim2.new(1,-8,0,math.max(24,#rows*23))
+        bomScroll.CanvasSize=UDim2.fromOffset(0,#rows*23)
+    end
+    local function refreshPreviewBOM()
+        if not build.busy then build.bom=newBOM(build.records);renderBOM() end
+    end
+    local function placementKey(position, name)
+        return string.format("%.1f,%.1f,%.1f:%s",position.X,position.Y,position.Z,name)
+    end
+    local function samplePlaced(report)
+        local blocks=ownBlocks()
+        local available={}
+        for _, block in ipairs(blocks:GetChildren()) do
+            local part=blockPart(block)
+            if part then
+                local key=placementKey(part.Position,block.Name)
+                available[key]=(available[key] or 0)+1
+            end
+        end
+        report.placed=0
+        local missing={}
+        for _, row in pairs(report.byName) do row.placed=0 end
+        for _, record in ipairs(report.records) do
+            local key=placementKey(record.cf.Position,record.name)
+            if (available[key] or 0)>0 then
+                available[key]=available[key]-1
+                report.placed=report.placed+1
+                report.byName[record.name].placed=report.byName[record.name].placed+1
+            else
+                table.insert(missing,record)
+            end
+        end
+        return missing
+    end
+    local function bounds()
+        assert(build.first and build.last, "Set both selection corners first.")
+        local a, b = build.first, build.last
+        return Vector3.new(math.min(a.X,b.X),math.min(a.Y,b.Y),math.min(a.Z,b.Z)),
+            Vector3.new(math.max(a.X,b.X),math.max(a.Y,b.Y),math.max(a.Z,b.Z))
+    end
+    local function selectionCount()
+        local low, high = bounds()
+        local size = (high - low) / 3
+        return (math.floor(size.X+0.01)+1)*(math.floor(size.Y+0.01)+1)*(math.floor(size.Z+0.01)+1)
+    end
+    local function redraw()
+        local text = "Preview: " .. #build.records .. " blocks"
+        if build.first and build.last then
+            local low, high = bounds()
+            box.Size = high - low + Vector3.new(3,3,3)
+            box.CFrame = CFrame.new((low+high)/2)
+            outline.Adornee = box
+            local count = selectionCount()
+            text = "Selection: " .. count .. " cells | " .. text .. " | minimum " .. math.ceil(count/build.speed) .. " seconds to print"
+        else
+            outline.Adornee = nil
+        end
+        Counts:SetDesc(text)
+    end
+    local function ensureIdle()
+        assert(not build.busy, "Stop the current build before editing the selection or preview.")
+        assert(state.running, "RoSnipe is unloaded.")
+    end
+    local function clearPreview()
+        handles.Visible = false
+        handles.Adornee = nil
+        preview:ClearAllChildren()
+        build.records = {}
+        refreshPreviewBOM()
+        redraw()
+    end
+    local function showPreview(records)
+        assert(#records > 0 and #records <= MAX_BLOCKS, "Preview must contain 1–20000 blocks.")
+        -- Construct off-workspace first; a bad template must not erase a good preview.
+        local staged = Instance.new("Model")
+        local ok, err = pcall(function()
+            local assets = ReplicatedStorage:FindFirstChild("Blocks")
+            for _, record in ipairs(records) do
+                local template = assets and assets:FindFirstChild(record.name)
+                local root = template and blockPart(template)
+                local part = root and root:Clone() or Instance.new("Part")
+                part.Parent = staged
+                for _, descendant in ipairs(part:GetDescendants()) do
+                    if descendant:IsA("LuaSourceContainer") then descendant:Destroy() end
+                end
+                if not root then part.Size = Vector3.new(3,3,3) end
+                part.Name, part.CFrame = record.name, record.cf
+                part.Anchored, part.CanCollide, part.CanTouch, part.CanQuery = true, build.collision, false, false
+                part.Transparency, part.LocalTransparencyModifier = 0.45, 0
+                for _, descendant in ipairs(part:GetDescendants()) do
+                    if descendant:IsA("BasePart") then
+                        descendant.Anchored, descendant.CanCollide, descendant.CanTouch, descendant.CanQuery = true, false, false, false
+                        descendant.Transparency, descendant.LocalTransparencyModifier = 0.45, 0
+                    end
+                end
+                record.preview = part
+            end
+        end)
+        if not ok then staged:Destroy(); error(err, 0) end
+        clearPreview()
+        for _, part in ipairs(staged:GetChildren()) do part.Parent = preview end
+        staged:Destroy()
+        build.records = records
+        refreshPreviewBOM()
+        redraw()
+    end
+    local function previewAnchor()
+        assert(#build.records > 0, "Clone blocks or load a file first.")
+        return build.records[1].cf.Position
+    end
+    local function transformPreview(transform)
+        ensureIdle()
+        for _, record in ipairs(build.records) do
+            record.cf = transform * record.cf
+            record.preview.CFrame = record.cf
+        end
+        refreshPreviewBOM()
+        redraw()
+    end
+    local function movePreview(position)
+        local anchor = previewAnchor()
+        transformPreview(CFrame.new(snapVector(position-anchor)))
+    end
+    local function selectedBlocks()
+        local low, high = bounds()
+        local found = {}
+        for _, block in ipairs(ownBlocks():GetChildren()) do
+            local part = blockPart(block)
+            if part then
+                local p = part.Position
+                if p.X >= low.X-0.1 and p.X <= high.X+0.1 and p.Y >= low.Y-0.1 and p.Y <= high.Y+0.1
+                    and p.Z >= low.Z-0.1 and p.Z <= high.Z+0.1 then
+                    table.insert(found, { block = block, part = part, name = block.Name, cf = part.CFrame })
+                end
+            end
+        end
+        assert(#found <= MAX_BLOCKS, "Selection exceeds 20000 blocks; choose a smaller area.")
+        table.sort(found, function(a,b)
+            if a.cf.Y ~= b.cf.Y then return a.cf.Y < b.cf.Y end
+            if a.cf.X ~= b.cf.X then return a.cf.X < b.cf.X end
+            return a.cf.Z < b.cf.Z
+        end)
+        return found
+    end
+    local function serialize(records)
+        local data = { Version = 1, Blocks = {} }
+        for _, record in ipairs(records) do
+            data.Blocks[record.name] = data.Blocks[record.name] or {}
+            table.insert(data.Blocks[record.name], { C = {record.cf:GetComponents()}, upperBlock = record.upperBlock == true })
+        end
+        return data
+    end
+    local function deserialize(data)
+        assert(type(data) == "table", "Invalid schematic file.")
+        local records = {}
+        local function add(name, c, upperBlock)
+            assert(type(name)=="string" and name~="", "Invalid block type in schematic.")
+            assert(type(c)=="table" and (#c==3 or #c==12), "Block position must have 3 or 12 numbers.")
+            for _, n in ipairs(c) do assert(finite(n), "Invalid coordinate in schematic.") end
+            assert(upperBlock==nil or type(upperBlock)=="boolean", "Invalid upperBlock flag.")
+            table.insert(records, {name=name, cf=CFrame.new(table.unpack(c)), upperBlock=upperBlock==true})
+            assert(#records<=MAX_BLOCKS, "Schematic exceeds 20000 blocks.")
+        end
+        if data.blocks ~= nil then
+            -- Flare-style blueprints, verified against TrueHickory.json (1120 records).
+            assert(type(data.blocks)=="table", "Invalid blocks field.")
+            for _, entry in ipairs(data.blocks) do
+                assert(type(entry)=="table", "Invalid blueprint entry.")
+                add(entry.blockType, entry.cframe, entry.upperBlock)
+            end
+        else
+            local groups = data.Blocks or data
+            assert(type(groups)=="table", "Invalid Blocks field.")
+            for name, entries in pairs(groups) do
+                assert(type(entries)=="table", "Invalid block group.")
+                for _, entry in ipairs(entries) do
+                    assert(type(entry)=="table", "Invalid block entry.")
+                    add(name, data.Blocks and entry.C or entry, data.Blocks and entry.upperBlock or nil)
+                end
+            end
+        end
+        table.sort(records, function(a,b)
+            if a.cf.Y~=b.cf.Y then return a.cf.Y<b.cf.Y end
+            if a.cf.X~=b.cf.X then return a.cf.X<b.cf.X end
+            return a.cf.Z<b.cf.Z
+        end)
+        assert(#records>0, "Schematic is empty.")
+        return records
+    end
+    local function positionLoadedPreview(records)
+        if not build.loadNearPlayer then return end
+        local _, _, root = getCharacter()
+        assert(root, "Wait for your character, or disable Load Preview Near Me.")
+        local look = root.CFrame.LookVector
+        local forward = Vector3.new(look.X, 0, look.Z)
+        forward = forward.Magnitude>0.01 and forward.Unit or Vector3.new(0,0,-1)
+        local target = root.Position + forward*12
+        -- Align to the target island's grid when a nearby block is available.
+        local ok, blocks = pcall(ownBlocks)
+        local anchor, distance = nil, 60
+        if ok then
+            for _, block in ipairs(blocks:GetChildren()) do
+                local part = blockPart(block)
+                if part and (part.Position-root.Position).Magnitude<distance then
+                    anchor, distance = part.Position, (part.Position-root.Position).Magnitude
+                end
+            end
+        end
+        if anchor then
+            target = anchor + snapVector(Vector3.new(target.X,anchor.Y+3,target.Z)-anchor)
+        else
+            target = snapVector(target)
+        end
+        local offset = target-records[1].cf.Position
+        for _, record in ipairs(records) do record.cf=record.cf+offset end
+    end
+    local function safeFileName(name)
+        assert(type(name) == "string" and name:match("^[%w _%.%-]+$") and not name:find("..",1,true), "Use a simple file name without folders or '..'.")
+        return name
+    end
+    local function filePath() return build.folder .. "/" .. safeFileName(build.file) end
+    local function ensureFolders()
+        assert(type(isfolder)=="function" and type(makefolder)=="function", "Executor folder APIs are unavailable.")
+        if build.folder == "RoSnipe/Schematica" then
+            if not isfolder("RoSnipe") then makefolder("RoSnipe") end
+            if not isfolder(build.folder) then makefolder(build.folder) end
+        else
+            assert(isfolder(build.folder), "Selected build folder is missing: " .. build.folder)
+        end
+    end
+    -- Support the verified PlaceVersion 1246 sender (key 23, hash 24), plus the
+    -- original 2024 layout. Never concatenate the current argument table at slot 25.
+    local function resolvePlacement()
+        local info = getinfo or (debug and debug.getinfo)
+        local constants = getconstants or (debug and debug.getconstants)
+        local protos = getprotos or (debug and debug.getprotos)
+        assert(getgc and info and constants, "Executor is missing build hash lookup APIs.")
+        local remote = netManaged():FindFirstChild("CLIENT_BLOCK_PLACE_REQUEST")
+        assert(remote and remote:IsA("RemoteFunction"), "CLIENT_BLOCK_PLACE_REQUEST RemoteFunction not found.")
+        local candidates = {}
+        local function hasConstant(values, wanted)
+            for _, value in pairs(values) do if value == wanted then return true end end
+            return false
+        end
+        local function inspect(fn, depth)
+            local ok, values = pcall(constants, fn)
+            if ok and type(values)=="table" then
+                local key, value
+                if values[22]=="blockType" and type(values[23])=="string" and type(values[24])=="string"
+                    and values[26]=="Client" and values[27]=="CLIENT_BLOCK_PLACE_REQUEST"
+                    and values[28]=="Get" and values[29]=="CallServerAsync" then
+                    key, value = values[23], values[24]
+                elseif hasConstant(values,"CLIENT_BLOCK_PLACE_REQUEST") and type(values[23])=="string"
+                    and type(values[25])=="string" and type(values[26])=="string" then
+                    key, value = values[23], values[25]..values[26]
+                end
+                if key and key~="" and value~="" and key~="cframe" and key~="blockType" and key~="upperBlock" then
+                    candidates[key .. "\0" .. value] = {key=key, value=value}
+                end
+            end
+            if depth < 2 and type(protos)=="function" then
+                local read, children = pcall(protos,fn)
+                if read and type(children)=="table" then
+                    for _, child in pairs(children) do inspect(child,depth+1) end
+                end
+            end
+        end
+        for _, fn in pairs(getgc(true)) do
+            if type(fn)=="function" then
+                local ok, details = pcall(info,fn)
+                local source = ok and type(details)=="table" and (details.source or details.short_src)
+                if type(source)=="string" and source:find("controllers.block.block-controller",1,true) then inspect(fn,0) end
+            end
+        end
+        local match
+        for _, candidate in pairs(candidates) do
+            assert(not match, "Multiple placement hashes found. Save a Build Diagnostic.")
+            match = candidate
+        end
+        assert(match, "Supported placement hash layout not found. Place one block manually, then Refresh Build Hash. If it still fails, Save Build Diagnostic.")
+        placeRemote, placeKey, placeHash = remote, match.key, match.value
+        status("Placement hash resolved from the current block controller.")
+    end
+    local function saveDiagnostic()
+        local info = getinfo or (debug and debug.getinfo)
+        local constants = getconstants or (debug and debug.getconstants)
+        local protos = getprotos or (debug and debug.getprotos)
+        assert(getgc and info and constants, "Executor introspection APIs unavailable.")
+        local lines = {"RoSnipe build diagnostic", "PlaceId="..game.PlaceId.." PlaceVersion="..game.PlaceVersion}
+        local function dump(fn, label, depth)
+            table.insert(lines,label)
+            local ok, values = pcall(constants,fn)
+            if ok and type(values)=="table" then
+                local keys={}
+                for key in pairs(values) do if type(key)=="number" then table.insert(keys,key) end end
+                table.sort(keys)
+                for _, key in ipairs(keys) do
+                    local value=values[key]
+                    table.insert(lines,"constant["..key.."]="..(type(value)=="string" and string.format("%q",value) or "<"..type(value)..">"))
+                end
+            end
+            if depth<2 and type(protos)=="function" then
+                local read, children=pcall(protos,fn)
+                if read and type(children)=="table" then
+                    for i, child in pairs(children) do dump(child,label..".proto["..tostring(i).."]",depth+1) end
+                end
+            end
+        end
+        for _, fn in pairs(getgc(true)) do
+            if type(fn)=="function" then
+                local ok, details=pcall(info,fn)
+                local source=ok and type(details)=="table" and (details.source or details.short_src)
+                if type(source)=="string" and (source:find("controllers.block.block-controller",1,true)
+                    or source:find("pickaxe",1,true) or source:find("gregsHammer",1,true)) then
+                    dump(fn,(details.name or "unnamed").." | "..source,0)
+                end
+            end
+        end
+        assert(type(writefile)=="function", "writefile unavailable; cannot save diagnostic.")
+        writefile("islands-build-diagnostic.txt", table.concat(lines,"\n"))
+        status("Saved islands-build-diagnostic.txt in the executor workspace.")
+    end
+    local function stop(why, cleanup)
+        build.version = build.version+1
+        build.mode = nil
+        build.paused = false
+        if build.releaseMovement then build.releaseMovement() end
+        handles.Visible = false
+        if mouse.TargetFilter == objects then mouse.TargetFilter = originalFilter end
+        if why then status(why) end
+        if build.bom and build.busy then
+            build.bom.phase, build.bom.currentName = "Stopped", nil
+            renderBOM()
+        end
+        if cleanup then
+            if debugEnvironment.RoSnipeBuildDebug == debugBridge then debugEnvironment.RoSnipeBuildDebug = nil end
+            for _, c in ipairs(buildConnections) do c:Disconnect() end
+            handles:Destroy()
+            bomGui:Destroy()
+            objects:Destroy()
+        end
+    end
+    stopAutoBuild = stop
+    local function stopFarms()
+        farmToggle:SetValue(false)
+        auraToggle:SetValue(false)
+        stopCutting()
+    end
+    local LAST_BUILD_PATH = "RoSnipe/last-build.json"
+    local function copyRecords(records)
+        local copied={}
+        for _,record in ipairs(records) do
+            table.insert(copied,{name=record.name,cf=record.cf,upperBlock=record.upperBlock==true})
+        end
+        return copied
+    end
+    local function rememberBuild(records)
+        local blocks=ownBlocks()
+        build.lastBuild={records=copyRecords(records),island=blocks.Parent.Name,placeId=game.PlaceId}
+        if type(writefile)=="function" and type(isfolder)=="function" and type(makefolder)=="function" then
+            local ok,err=pcall(function()
+                if not isfolder("RoSnipe") then makefolder("RoSnipe") end
+                writefile(LAST_BUILD_PATH,HttpService:JSONEncode({Version=1,PlaceId=game.PlaceId,Island=blocks.Parent.Name,Build=serialize(records)}))
+            end)
+            if not ok then trace("Continue Last Build: memory only",err) end
+        else
+            trace("Continue Last Build","Saved for this session only; file APIs unavailable.")
+        end
+    end
+    local function lastBuildRecords()
+        if not build.lastBuild then
+            assert(type(readfile)=="function","No last build in this session; readfile is unavailable.")
+            local text=readfile(LAST_BUILD_PATH)
+            assert(#text<=10*1024*1024,"Last build data exceeds 10 MB.")
+            local data=HttpService:JSONDecode(text)
+            assert(type(data)=="table" and not data.Cleared and data.Build,"No saved last build.")
+            build.lastBuild={records=deserialize(data.Build),island=data.Island,placeId=data.PlaceId}
+        end
+        assert(build.lastBuild.placeId==game.PlaceId,"Last build belongs to a different game place.")
+        assert(ownBlocks().Parent.Name==build.lastBuild.island,"Return to the island where the last build started.")
+        return copyRecords(build.lastBuild.records)
+    end
+    local function clearLastBuild()
+        ensureIdle()
+        if type(isfile)=="function" and isfile(LAST_BUILD_PATH) then
+            if type(delfile)=="function" then delfile(LAST_BUILD_PATH)
+            else
+                assert(type(writefile)=="function","Cannot clear the saved last-build file.")
+                writefile(LAST_BUILD_PATH,HttpService:JSONEncode({Cleared=true}))
+            end
+        end
+        build.lastBuild=nil
+        status("Last build data cleared. Your files and placed blocks are unchanged.")
+    end
+    local function invoke(remote, payload, current, waitReady)
+        assert(not pendingRequest or pendingRequest.done, "Previous build request is still waiting for the server.")
+        if not waitReady() then return false end
+        local request = {done=false}
+        pendingRequest = request
+        task.spawn(function()
+            -- A pause/stop may happen before this scheduled call actually starts.
+            if not waitReady() then request.cancelled=true;request.done=true;return end
+            request.ok, request.result = pcall(function() return remote:InvokeServer(payload) end)
+            request.done = true
+        end)
+        local deadline = os.clock()+8
+        while not request.done and current() do
+            if build.paused then deadline=os.clock()+8 end
+            if os.clock()>=deadline then break end
+            task.wait(0.05)
+        end
+        if not current() or request.cancelled then return false end
+        assert(request.done, "Build request timed out. Stop; wait for the server before retrying.")
+        assert(request.ok, tostring(request.result))
+        return true, request.result~=false
+    end
+    local function startJob(kind, records, instant, missingOnly)
+        ensureIdle()
+        assert(#records>0 and #records<=MAX_BLOCKS, "Load a ghost preview or select 1–20000 blocks first.")
+        assert(not pendingRequest or pendingRequest.done, "Previous request is still pending.")
+        local character, humanoid, root = getCharacter()
+        assert(character, "Wait for your character.")
+        local tool = character:FindFirstChildOfClass("Tool")
+        if kind~="place" then
+            assert(tool,"Equip a pickaxe or Greg's Hammer.")
+            if instant then assert(tool.Name=="gregsHammer","Equip gregsHammer for instant destroy.") end
+        end
+        if kind=="place" then rememberBuild(records) end
+        stopFarms()
+        build.busy, build.paused, build.mode = true, false, nil
+        handles.Visible = false
+        local token = build.version
+        local original = root.CFrame
+        local frozen, movementConnection
+        local savedCollisions={}
+        local function releaseMovement()
+            if movementConnection then movementConnection:Disconnect();movementConnection=nil end
+            if frozen then frozen:Destroy();frozen=nil end
+            for part,value in pairs(savedCollisions) do if part.Parent then part.CanCollide=value end end
+            savedCollisions={}
+        end
+        build.releaseMovement=releaseMovement
+        local report
+        if kind=="place" then
+            report=newBOM(records)
+            report.started,report.phase=true,"Starting"
+            build.bom=report
+            bomGui.Enabled=build.showHUD
+            renderBOM()
+        end
+        local function current()
+            return state.running and build.version==token and LocalPlayer.Character==character and humanoid.Health>0
+        end
+        local function waitReady()
+            while current() and build.paused do task.wait(0.1) end
+            return current()
+        end
+        local function syncMovement()
+            if not current() then releaseMovement();return end
+            if build.noclip then
+                for _,part in ipairs(character:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        if savedCollisions[part]==nil then savedCollisions[part]=part.CanCollide end
+                        part.CanCollide=false
+                    end
+                end
+            else
+                for part,value in pairs(savedCollisions) do if part.Parent then part.CanCollide=value end end
+                savedCollisions={}
+            end
+            if build.teleport or build.moveNear then
+                if not frozen then
+                    frozen=Instance.new("BodyVelocity")
+                    frozen.Name="RoSnipeBuildHover";frozen.MaxForce=Vector3.new(1e9,1e9,1e9);frozen.Velocity=Vector3.zero;frozen.Parent=root
+                end
+            elseif frozen then frozen:Destroy();frozen=nil end
+        end
+        local function arrange(queue)
+            local center=root.Position
+            table.sort(queue,function(a,b)
+                if build.useRadius then
+                    local aNear=(a.cf.Position-center).Magnitude<=build.radius
+                    local bNear=(b.cf.Position-center).Magnitude<=build.radius
+                    if aNear~=bNear then return aNear end
+                end
+                if a.cf.Y~=b.cf.Y then return a.cf.Y<b.cf.Y end
+                if a.cf.X~=b.cf.X then return a.cf.X<b.cf.X end
+                return a.cf.Z<b.cf.Z
+            end)
+        end
+        task.spawn(function()
+            local ok,err=xpcall(function()
+                if kind=="place" then
+                    if not placeRemote or not placeRemote.Parent then resolvePlacement() end
+                elseif not treeRemote or not treeRemote.Parent then resolveTreeCombat() end
+                if not waitReady() then return end
+                syncMovement()
+                movementConnection=RunService.Heartbeat:Connect(syncMovement)
+                local missing
+                if report then
+                    missing=samplePlaced(report)
+                    report.existing=report.placed
+                    renderBOM()
+                    task.spawn(function()
+                        while current() and build.busy and build.bom==report do
+                            local sampled,sampleError=pcall(samplePlaced,report)
+                            if not sampled then trace("BOM verification",sampleError) end
+                            if state.running then renderBOM() end
+                            task.wait(0.5)
+                        end
+                    end)
+                end
+                local requests,confirmed=0,0
+                local passes=kind=="place" and (1+build.retryPasses) or 1
+                local queue=(missingOnly and missing) or records
+                for pass=1,passes do
+                    if not waitReady() or #queue==0 then break end
+                    arrange(queue)
+                    for index,record in ipairs(queue) do
+                        if not waitReady() then break end
+                        if kind~="place" then assert(tool.Parent==character,"Building tool changed; job stopped.") end
+                        if report then
+                            report.phase,report.currentName=pass==1 and "Placing" or ("Retry "..(pass-1)),record.name
+                            renderBOM()
+                        end
+                        if build.moveNear or (build.teleport and (root.Position-record.cf.Position).Magnitude>24) then
+                            root.CFrame=CFrame.new(record.cf.Position+Vector3.new(0,10,0))
+                            task.wait(0.15)
+                        end
+                        if not waitReady() then break end
+                        assert((root.Position-record.cf.Position).Magnitude<=30,"Target out of reach. Enable Move To Build Position or Move Near Block Before Placing.")
+                        if kind=="place" then
+                            local sent,accepted=invoke(placeRemote,{[placeKey]=placeHash,cframe=record.cf,blockType=record.name,upperBlock=record.upperBlock==true},current,waitReady)
+                            if not sent then break end
+                            requests=requests+1;report.sent=requests
+                            if not accepted then trace("placement rejected",record.name.."; will recheck on the next pass") end
+                            renderBOM()
+                        else
+                            for _=1,instant and 1 or 40 do
+                                if not waitReady() or not record.block.Parent then break end
+                                local sent,accepted=invoke(treeRemote,{[treeHashKey]=treeHashValue,part=record.part,block=record.block,
+                                    norm=record.part.CFrame.UpVector,pos=record.part.Position},current,waitReady)
+                                if not sent then break end
+                                assert(accepted,"Server rejected the block hit.")
+                                requests=requests+1
+                                task.wait(instant and 1/build.speed or 0.3)
+                            end
+                            if not record.block.Parent then confirmed=confirmed+1 end
+                        end
+                        if not build.paused then
+                            status(report and ("Placed "..report.placed.." / "..report.total.." | "..report.phase.." "..record.name)
+                                or ("Destroying "..index.."/"..#queue))
+                        end
+                        task.wait(1/build.speed)
+                    end
+                    if report and waitReady() then
+                        task.wait(0.5)
+                        if not waitReady() then break end
+                        queue=samplePlaced(report)
+                        confirmed=report.placed
+                        if #queue==0 then break end
+                    end
+                end
+                if waitReady() then
+                    if report then
+                        report.phase=report.placed==report.total and "Finished" or "Finished — blocks still missing"
+                        report.currentName=nil
+                        renderBOM()
+                        status("Build finished: "..report.placed.." / "..report.total.." blocks visible; "..requests.." placement requests."
+                            ..(report.placed<report.total and " Use PLACE MISSING after checking materials." or ""))
+                    else status("Destroy finished: "..confirmed.."/"..#records.." blocks removed.") end
+                end
+            end,traceback)
+            releaseMovement()
+            if build.releaseMovement==releaseMovement then build.releaseMovement=nil end
+            if current() and (build.teleport or build.moveNear) then root.CFrame=original end
+            build.busy,build.paused=false,false
+            if report and state.running then
+                if not ok then report.phase="Error";report.currentName=nil
+                elseif not current() then report.phase="Stopped";report.currentName=nil end
+                renderBOM()
+            end
+            if not ok and state.running then trace("job error",err);status("Build error: "..tostring(err)) end
+        end)
+    end
+    local function action(section, title, fn)
+        table.insert(build.actions, title)
+        section:AddButton({Title=title, Callback=function()
+            trace("button", title)
+            local ok, err=xpcall(fn, traceback)
+            if not ok then trace("button error: "..title, err); status("Build error: "..tostring(err))
+            else trace("callback returned", title) end
+        end})
+    end
+    local function arm(mode)
+        ensureIdle()
+        stopFarms()
+        build.mode=mode
+        mouse.TargetFilter=objects
+        status("Hide RoSnipe with Right Shift, then click a block: "..mode..".")
+    end
+    connect(UserInputService.InputBegan,function(input,processed)
+        if processed or input.UserInputType~=Enum.UserInputType.MouseButton1 or not build.mode
+            or not Window.Minimized or UserInputService:GetFocusedTextBox() or build.busy then return end
+        local ok,err=pcall(function()
+            local hit=mouse.Target
+            assert(hit, "Click an island block.")
+            local block=hit
+            while block.Parent and block.Parent.Name~="Blocks" do block=block.Parent end
+            local islands = workspace:FindFirstChild("Islands")
+            assert(islands and block.Parent and block.Parent.Name=="Blocks" and block:IsDescendantOf(islands), "Click an island block.")
+            local part=blockPart(block)
+            assert(part,"Selected block has no part.")
+            if build.mode=="Move preview to mouse" then
+                movePreview(part.Position+Vector3.new(0,3,0))
+            else
+                if build.mode=="First corner" or build.mode=="New selection" then
+                    build.blocks=block.Parent; build.first=part.Position; build.last=part.Position
+                else
+                    assert(block.Parent==build.blocks,"Both corners must be on the same island.")
+                    build.last=build.first+snapVector(part.Position-build.first)
+                end
+                redraw()
+            end
+            build.mode=nil
+            if mouse.TargetFilter==objects then mouse.TargetFilter=originalFilter end
+            status("Selection updated. Open RoSnipe with Right Shift.")
+        end)
+        if not ok then status(tostring(err)) end
+    end)
+    local dragStart
+    connect(handles.MouseButton1Down,function()
+        if build.busy then return end
+        dragStart={first=build.first,last=build.last, records={}}
+        for i,record in ipairs(build.records) do dragStart.records[i]=record.cf end
+    end)
+    connect(handles.MouseDrag,function(face,distance)
+        if build.busy or not dragStart then return end
+        local ok,err=pcall(function()
+            local direction=Vector3.FromNormalId(face)
+            local delta=direction*snap(distance)
+            if build.handleMode=="Resize" then
+                assert(dragStart.first and dragStart.last,"Set corners first.")
+                local low=Vector3.new(math.min(dragStart.first.X,dragStart.last.X),math.min(dragStart.first.Y,dragStart.last.Y),math.min(dragStart.first.Z,dragStart.last.Z))
+                local high=Vector3.new(math.max(dragStart.first.X,dragStart.last.X),math.max(dragStart.first.Y,dragStart.last.Y),math.max(dragStart.first.Z,dragStart.last.Z))
+                if direction.X+direction.Y+direction.Z>0 then high=high+delta else low=low+delta end
+                if high.X<low.X or high.Y<low.Y or high.Z<low.Z then return end
+                build.first,build.last=low,high
+            else
+                if #build.records>0 then
+                    for i,record in ipairs(build.records) do record.cf=dragStart.records[i]+delta; record.preview.CFrame=record.cf end
+                    refreshPreviewBOM()
+                elseif dragStart.first and dragStart.last then
+                    build.first,build.last=dragStart.first+delta,dragStart.last+delta
+                end
+            end
+            redraw()
+        end)
+        if not ok then status(tostring(err)) end
+    end)
+    local function editHandles(mode,enabled)
+        ensureIdle()
+        if not enabled then
+            if build.handleMode==mode then handles.Visible=false; build.handleMode=nil end
+            return
+        end
+        stopFarms()
+        build.handleMode=mode
+        handles.Style=mode=="Resize" and Enum.HandlesStyle.Resize or Enum.HandlesStyle.Movement
+        if mode=="Move" and #build.records>0 then handles.Adornee=build.records[1].preview
+        else assert(build.first and build.last,"Set selection corners first."); handles.Adornee=box end
+        handles.Visible=true
+        status(mode.." handles ready. Hide RoSnipe with Right Shift and drag a handle.")
+    end
+    local settings=AutoBuild:AddSection("BUILD SETTINGS")
+    local function toggle(section,id,title,description,default,callback)
+        local item=section:AddToggle(id,{Title=title,Description=description,Default=default})
+        item:OnChanged(callback)
+        return item
+    end
+    toggle(settings,"BuildMoveNear","Move Near Block Before Placing","Move beside each block before its placement request.",false,function(v) build.moveNear=v end)
+    local controls=AutoBuild:AddSection("AUTOBUILD")
+    toggle(controls,"BuildTeleport","Move To Build Position","Moves within reach as the build progresses.",true,function(v) build.teleport=v end)
+    toggle(controls,"BuildUseRadius","Use Build Radius","Prioritizes blocks inside your radius first; remaining blocks follow.",false,function(v) build.useRadius=v end)
+    controls:AddSlider("BuildRadius",{Title="Build Radius",Default=85,Min=10,Max=200,Rounding=0,Callback=function(v) build.radius=v end})
+    controls:AddSlider("BuildRetries",{Title="Retry Passes",Description="Extra passes for blocks still missing after placement.",Default=4,Min=0,Max=10,Rounding=0,Callback=function(v) build.retryPasses=v end})
+    toggle(controls,"BuildShowHUD","Show Live Build HUD","Shows total progress and block type counters.",true,function(v)
+        build.showHUD=v
+        if build.busy and build.bom then bomGui.Enabled=v elseif not v then bomGui.Enabled=false end
+    end)
+    toggle(controls,"BuildNoclip","Auto Noclip While Building","Stops your character from getting stuck while building.",true,function(v) build.noclip=v end)
+    action(controls,"BUILD HERE",function() startJob("place",copyRecords(build.records),false,false) end)
+    action(controls,"PLACE MISSING",function() startJob("place",copyRecords(build.records),false,true) end)
+    action(controls,"Pause / Resume Build",function()
+        assert(build.busy,"No build is running.")
+        build.paused=not build.paused
+        if build.bom then build.bom.phase=build.paused and "Paused" or "Resuming";renderBOM() end
+        status(build.paused and "Build paused. An already-sent request may finish." or "Build resumed.")
+    end)
+    action(controls,"Continue Last Build",function() ensureIdle();startJob("place",lastBuildRecords(),false,true) end)
+    action(controls,"Clear Last Build Data",clearLastBuild)
+    action(controls,"Stop Build",function() stop("Stopped. Continue Last Build can place the remaining blocks.") end)
+    action(controls,"Blocks",function()
+        if not build.busy and (not build.bom or not build.bom.started) then refreshPreviewBOM() end
+        assert(build.bom and build.bom.total>0,"Load a ghost preview or use Check Blocks in File first.")
+        bomGui.Enabled=not bomGui.Enabled
+        renderBOM()
+    end)
+    controls:AddSlider("BuildSpeed",{Title="Build Speed (requests/sec)",Default=5,Min=1,Max=20,Rounding=0,Callback=function(v) build.speed=v;redraw() end})
+
+    local movement=GhostPreview:AddSection("GHOST MOVEMENT")
+    toggle(movement,"BuildMoveTool","Enable Moving Tool","Drag the ghost preview using its handles.",false,function(value)
+        local ok,err=pcall(editHandles,"Move",value)
+        if not ok then status(tostring(err)) end
+    end)
+    local rotations=GhostPreview:AddSection("ROTATE GHOST PREVIEW")
+    for _,axis in ipairs({"X","Y","Z"}) do
+        action(rotations,"Rotate 90° "..axis,function()
+            local pivot=previewAnchor()
+            local angle=math.pi/2
+            local rotation=CFrame.Angles(axis=="X" and angle or 0,axis=="Y" and angle or 0,axis=="Z" and angle or 0)
+            transformPreview(CFrame.new(pivot)*rotation*CFrame.new(-pivot))
+        end)
+    end
+    local function readSelectedFile()
+        assert(type(readfile)=="function","readfile unavailable.")
+        local data=readfile(filePath()):gsub("^\239\187\191","")
+        assert(#data<=10*1024*1024,"Schematic file exceeds 10 MB.")
+        local lines={}
+        for line in (data.."\n"):gmatch("(.-)\n") do if not line:match("^%s*%-%-") then table.insert(lines,line) end end
+        return deserialize(HttpService:JSONDecode(table.concat(lines,"\n")))
+    end
+    action(rotations,"Load Ghost Preview",function()
+        ensureIdle()
+        local records=readSelectedFile()
+        positionLoadedPreview(records)
+        showPreview(records)
+        status("Loaded "..#records.." ghost blocks. Move or rotate them, then choose BUILD HERE in Autobuild.")
+    end)
+    action(rotations,"Snap to My Position",function()
+        ensureIdle()
+        local _,_,root=getCharacter();assert(root,"Wait for your character.")
+        local anchor=previewAnchor()
+        -- Preserve rotations and spacing, moving the anchor to the player's grid cell.
+        transformPreview(CFrame.new(snapVector(root.Position)-anchor))
+    end)
+    action(rotations,"Clear Ghost Preview",function() ensureIdle();handles.Visible=false;clearPreview();status("Ghost preview cleared.") end)
+    toggle(rotations,"BuildLoadNearPlayer","Load Preview Near Me","Disable to retain the file's saved coordinates.",true,function(v) build.loadNearPlayer=v end)
+    toggle(rotations,"BuildPreviewCollision","Build Collision (Preview)",nil,false,function(v)
+        build.collision=v
+        for _,record in ipairs(build.records) do record.preview.CanCollide=v end
+    end)
+
+    local selection=BuildFiles:AddSection("SELECTION")
+    action(selection,"Set First Corner",function() arm("First corner") end)
+    action(selection,"Set Second Corner",function() arm("Second corner") end)
+    action(selection,"Change Position / New Selection",function() arm("New selection") end)
+    toggle(selection,"BuildResizeTool","Use Resize Tool",nil,false,function(v)
+        local ok,err=pcall(editHandles,"Resize",v)
+        if not ok then status(tostring(err)) end
+    end)
+    local save=BuildFiles:AddSection("SAVE SELECTION")
+    save:AddInput("BuildFileName",{Title="File Name (no extension)",Default="mybuild",Finished=true,Callback=function(v) build.saveName=v end})
+    local fullIsland=BuildFiles:AddSection("COPY FULL ISLAND")
+    local files=BuildFiles:AddSection("BUILD FILES")
+    local fileDropdown=files:AddDropdown("BuildFiles",{Title="Build File",Values={},Multi=false})
+    fileDropdown:OnChanged(function(v) if v then build.file=v end end)
+    local function refreshFiles()
+        assert(type(listfiles)=="function","listfiles is unavailable.")
+        ensureFolders()
+        local names={}
+        for _,path in ipairs(listfiles(build.folder)) do
+            if type(isfile)~="function" or isfile(path) then
+                local name=path:match("([^/\\]+)$")
+                if name then table.insert(names,name) end
+            end
+        end
+        table.sort(names)
+        fileDropdown:SetValues(names)
+        if table.find(names,build.file) then fileDropdown:SetValue(build.file)
+        elseif #names>0 then fileDropdown:SetValue(names[1])
+        else fileDropdown:SetValue(nil);build.file="" end
+        status("Found "..#names.." build files in "..build.folder)
+    end
+    local folder=files:AddDropdown("BuildFileFolder",{Title="Build Folder",Values={"RoSnipe/Schematica","Nekohub/Islands/Schematica","Flare Hub/Islands/blueprints"},Default="RoSnipe/Schematica",Multi=false})
+    folder:OnChanged(function(v)
+        build.folder=v
+        local ok,err=pcall(refreshFiles)
+        if not ok then status("File list: "..tostring(err)) end
+    end)
+    local function saveRecords(records)
+        ensureIdle()
+        assert(#records>0 and #records<=MAX_BLOCKS,"Choose 1–20000 blocks to save.")
+        assert(type(writefile)=="function" and type(isfile)=="function","File saving APIs unavailable.")
+        ensureFolders()
+        local name=safeFileName(build.saveName)
+        if not name:lower():match("%.json$") then name=name..".json" end
+        local path=build.folder.."/"..name
+        assert(not isfile(path),"File already exists. Choose a different File Name.")
+        local data={blocks={}}
+        for _,record in ipairs(records) do
+            table.insert(data.blocks,{blockType=record.name,upperBlock=record.upperBlock==true,cframe={record.cf:GetComponents()}})
+        end
+        writefile(path,HttpService:JSONEncode(data))
+        build.file=name
+        refreshFiles()
+        status("Saved "..#records.." blocks to "..path)
+    end
+    action(save,"Save Selection to File",function() saveRecords(selectedBlocks()) end)
+    action(fullIsland,"Copy All Blocks on Island",function()
+        ensureIdle()
+        local records={}
+        for _,block in ipairs(ownBlocks():GetChildren()) do
+            local part=blockPart(block)
+            if part then table.insert(records,{name=block.Name,cf=part.CFrame}) end
+            assert(#records<=MAX_BLOCKS,"Island exceeds 20000 blocks; save smaller selections.")
+        end
+        saveRecords(records)
+    end)
+    action(files,"Select Build File",function() refreshFiles();fileDropdown:Open() end)
+    action(files,"Check Blocks in File",function()
+        ensureIdle()
+        build.bom=newBOM(readSelectedFile())
+        build.bom.phase="Materials in "..build.file
+        bomGui.Enabled=true
+        renderBOM()
+        status("Materials listed for "..build.file..". The ghost preview has not changed.")
+    end)
+
+    -- Keep the original optional utilities separate from the screenshot workflow.
+    local tools=AutoBuild:AddSection("Block Printer / Diagnostics")
+    action(tools,"Print Blocks",function()
+        ensureIdle();assert(selectionCount()<=MAX_BLOCKS,"Selection exceeds 20000 cells.")
+        local character=getCharacter();local tool=character and character:FindFirstChildOfClass("Tool")
+        assert(tool,"Hold the block you want to print.")
+        local name=tool.Name
+        if tool:FindFirstChild("seeds") then name=name:gsub("Seeds$","") end
+        local assets=ReplicatedStorage:FindFirstChild("Blocks")
+        assert(assets and assets:FindFirstChild(name),"Held tool is not a recognized block: "..name)
+        local low,high=bounds();local records={}
+        for y=low.Y,high.Y,3 do for x=low.X,high.X,3 do for z=low.Z,high.Z,3 do
+            table.insert(records,{name=name,cf=CFrame.new(x,y,z)})
+        end end end
+        startJob("place",records,false,false)
+    end)
+    action(tools,"Refresh Build Hash",function() ensureIdle();placeRemote,placeKey,placeHash=nil,nil,nil;resolvePlacement() end)
+    action(tools,"Save Build Diagnostic",saveDiagnostic)
+    local extras=GhostPreview:AddSection("Selection Preview")
+    action(extras,"Clone Blocks",function()
+        ensureIdle()
+        local records=selectedBlocks()
+        for _,record in ipairs(records) do record.cf=record.cf+Vector3.new(0,3,0) end
+        showPreview(records);status("Selection copied into the ghost preview.")
+    end)
+    action(extras,"Move Ghost to Mouse",function() previewAnchor();arm("Move preview to mouse") end)
+    local destroy=AutoBuild:AddSection("Block Destroyer")
+    destroy:AddParagraph({Title="Selected Blocks",Content="Destroy acts on real blocks between the two selection corners."})
+    action(destroy,"Destroy Blocks [Beta]",function() startJob("destroy",selectedBlocks(),false) end)
+    action(destroy,"Instant Destroy Blocks (Greg's Hammer)",function() startJob("destroy",selectedBlocks(),true) end)
+    redraw()
+
+end
+installAutoBuild()
+
+local function shutdown()
+    if not state.running then return end
+    state.running = false
+    if stopAutoBuild then stopAutoBuild(nil, true) end
+    state.autoFarm, state.killAura = false, false
+    state.treeFarm, state.treeAura = false, false
+    stopCombat()
+    KillGui:Destroy()
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+end
+Settings:AddButton({
+    Title = "Unload",
+    Callback = function()
+        shutdown()
+        Fluent:Destroy()
+    end,
+})
+
+table.insert(connections, UserInputService.WindowFocusReleased:Connect(function()
+    windowFocused = false
+    stopCombat()
+end))
+table.insert(connections, UserInputService.WindowFocused:Connect(function()
+    windowFocused = true
+end))
+table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
+    if stopAutoBuild then stopAutoBuild("Stopped: character respawning.") end
+    stopCombat()
+    tokenTracker.previous = nil
+    tokenTracker.rebaseUntil = math.huge
+end))
+table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
+    stopCombat()
+    tokenTracker.previous = nil
+    tokenTracker.emptySince = nil
+    tokenTracker.rebaseUntil = os.clock() + 2
+    combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
+    treeRemote, treeHashKey, treeHashValue = nil, nil, nil
+    if state.autoFarm or state.killAura then
+        task.delay(1, refreshCombat)
+    end
+end))
+
+-- Constant-speed movement and hover are local to this farm; no player/fly tab required.
+table.insert(connections, RunService.Heartbeat:Connect(function(dt)
+    if Fluent.Unloaded then shutdown() return end
+    local character, humanoid, root = getCharacter()
+    if rageData and state.rageblade and state.weapon == "rageblade" and state.autoFarm
+        and character and rageTool and rageTool.Parent == character then
+        rageData.lastClicked = 0
+    elseif rageData then
+        restoreRageblade()
+    end
+    local destination
+    if state.treeFarm and validTreeTarget(state.treeTarget) then
+        -- Cutting stands beside the trunk; the -10 offset belongs to Combat only.
+        destination = state.treeTarget.trunk.Position + Vector3.new(0, 0, 6)
+    elseif state.autoFarm then
+        local target = state.target
+        local targetRoot = target and target.Parent and target:FindFirstChild("HumanoidRootPart")
+        local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
+        if targetRoot and targetHumanoid and targetHumanoid.Health > 0 then
+            destination = targetRoot.Position + Vector3.new(0, state.height, 0)
+        end
+    end
+    if resolving or not root or not destination then
+        restoreMovement()
+        return
+    end
+    if movementRoot ~= root then
+        restoreMovement()
+        movementRoot = root
+        floatVelocity = Instance.new("BodyVelocity")
+        floatVelocity.Name = "MobFarmHover"
+        floatVelocity.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+        floatVelocity.Velocity = Vector3.zero
+        floatVelocity.Parent = root
+    end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if collisions[part] == nil then collisions[part] = part.CanCollide end
+            part.CanCollide = false
+        end
+    end
+    local delta = destination - root.Position
+    if state.movement == "Instant" or delta.Magnitude <= state.speed * dt then
+        root.CFrame = CFrame.new(destination)
+    elseif delta.Magnitude > 0 then
+        root.CFrame = CFrame.new(root.Position + delta.Unit * state.speed * dt)
+    end
+end))
+
+task.spawn(function()
+    while state.running do
+        if not resolving and combatRemote and state.autoFarm then
+            local ok, err = pcall(function()
+                if state.autoFarm then
+                    state.target = findNearestMob(true)
+                    if state.target then attack(state.target, true) end
+                else
+                    state.target = nil
+                end
+            end)
+            if not ok then
+                state.autoFarm = false
+                stopCombat()
+                farmToggle:SetValue(false)
+                setStatus(tostring(err))
+                warn("[Mob Farm] " .. tostring(err))
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+task.spawn(function()
+    while state.running do
+        if (state.treeFarm or state.treeAura) and not resolving then
+            local ok, err = pcall(runTreeOnce)
+            if not ok then
+                stopCutting()
+                setTreeStatus("Cutting error: " .. tostring(err))
+            end
+        end
+        task.wait(state.treeInterval)
+    end
+end)
+
+-- One click worker serves both combat modes; remote attacks never wait on it.
+task.spawn(function()
+    while state.running do
+        if (state.autoFarm or state.killAura) and combatRemote and not resolving then
+            local ok, err = pcall(runCombatClick)
+            if not ok then
+                releaseCombatActivation()
+                setClickStatus(tostring(err) .. " | Close overlays and release left-click. Targeted hits remain enabled.")
+            end
+        else
+            releaseCombatActivation()
+            setClickStatus("Off")
+        end
+        task.wait(0.35)
+    end
+end)
+
+-- The stationary aura uses the same remote path as Mob Auto Farm.
+-- Auto Farm takes precedence if both toggles are enabled, avoiding duplicate bursts.
+task.spawn(function()
+    while state.running do
+        if state.killAura and not state.autoFarm and combatRemote and not resolving then
+            local ok, err = pcall(function()
+                local mob, reason = findAuraSlime()
+                if mob then attack(mob, false) else setAuraStatus(reason) end
+            end)
+            if not ok then
+                auraToggle:SetValue(false)
+                setAuraStatus("Slime Aura error: " .. tostring(err))
+            end
+        end
+        task.wait(state.auraInterval)
+    end
+end)
+
+-- Capture the baseline before starting the polling loop; owned tokens are not kills.
+tokenTracker.previous, tokenTracker.source = readTokenBalance()
+task.spawn(function()
+    while state.running do
+        local ok, err = pcall(function()
+            local amount, source, reason = readTokenBalance()
+            sampleTokenBalance(amount, source, os.clock())
+            tokenTracker.message = reason or "Tracking"
+            updateKillDisplay()
+        end)
+        if not ok then
+            tokenTracker.message = "Token tracking unavailable"
+            warn("[Kill Counter] " .. tostring(err))
+        end
+        task.wait(0.2)
+    end
+end)
+
+applyUIColor(selectedColor)
+Window:SelectTab(1)
