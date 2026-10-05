@@ -39,6 +39,7 @@ for _, layer in ipairs(windowPaint:GetDescendants()) do
 end
 local Main = Window:AddTab({ Title = "Combat", Icon = "sword" })
 local Cutting = Window:AddTab({ Title = "Cutting", Icon = "axe" })
+local Farming = Window:AddTab({ Title = "Farming", Icon = "leaf" })
 local AutoBuild = Window:AddTab({ Title = "Autobuild", Icon = "building-2" })
 local GhostPreview = Window:AddTab({ Title = "Ghost Preview", Icon = "eye" })
 local BuildFiles = Window:AddTab({ Title = "Build Files", Icon = "folder" })
@@ -76,6 +77,7 @@ local farmToggle, auraToggle
 local treeFarmToggle, treeAuraToggle
 local stopCutting
 local stopAutoBuild
+local stopFarming, resolveCropPlacement
 local generation = 0
 local combatRequests = 0
 local activeCombatActivation
@@ -804,6 +806,7 @@ farmToggle = MobSection:AddToggle("MobAutoFarmToggle", { Title = "Mob Auto Farm"
 farmToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
     if value and stopCutting then stopCutting() end
+    if value and stopFarming then stopFarming() end
     state.autoFarm = value
     stopCombat()
     if value and not combatRemote then task.spawn(refreshCombat) end
@@ -812,6 +815,7 @@ auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Au
 auraToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
     if value and stopCutting then stopCutting() end
+    if value and stopFarming then stopFarming() end
     state.killAura = value
     stopCombat()
     setAuraStatus(value and ("Starting; equipping " .. (state.weapon or "selected weapon") .. "...") or "Off")
@@ -1088,6 +1092,7 @@ stopCutting = function()
     setTreeStatus("Off")
 end
 local function setCuttingMode(mode, value)
+    if value and stopFarming then stopFarming() end
     if value and stopAutoBuild then stopAutoBuild("Stopped: cutting enabled.") end
     state[mode] = value
     stopCombat()
@@ -1638,6 +1643,10 @@ local function installAutoBuild()
         placeRemote, placeKey, placeHash = remote, match.key, match.value
         status("Placement hash resolved from the current block controller.")
     end
+    resolveCropPlacement = function()
+        if not placeRemote or not placeRemote.Parent or not placeKey or not placeHash then resolvePlacement() end
+        return placeRemote, placeKey, placeHash
+    end
     local function saveDiagnostic()
         local info = getinfo or (debug and debug.getinfo)
         local constants = getconstants or (debug and debug.getconstants)
@@ -1709,6 +1718,7 @@ local function installAutoBuild()
     end
     stopAutoBuild = stop
     local function stopFarms()
+        if stopFarming then stopFarming() end
         farmToggle:SetValue(false)
         auraToggle:SetValue(false)
         stopCutting()
@@ -2263,8 +2273,304 @@ local function installAutoBuild()
 end
 installAutoBuild()
 
+-- The original crop farm's sickle route; placement shares the verified build resolver.
+local function installFarming()
+    local farm = { mode=nil, selected={spiritCrop=true}, range=20, interval=2, batch=10,
+        replant=true, version=0, queue={}, harvested=0, planted=0 }
+    local sickles = {"sickleDiamond", "sickleIron", "sickleStone"}
+    local crops = {"all", "spiritCrop", "wheat", "carrot", "potato", "onion", "tomato",
+        "spinach", "pumpkin", "melon", "pineapple", "starfruit", "dragonfruit",
+        "chiliPepper", "grapeVine", "candyCaneVine", "berryBush", "blackberryBush", "blueberryBush"}
+    local cropSet = {}
+    for _, name in ipairs(crops) do cropSet[name]=true end
+    local status = Farming:AddParagraph({Title="Farming Status", Content="Select crops and enable a farm. Requires a stone, iron, or diamond sickle in your hotbar."})
+    local totals = Farming:AddParagraph({Title="Session Totals", Content="Harvested: 0 | Planted: 0"})
+    local toggles, pending = {}, nil
+    local changingMode=false
+    local lastMessage
+    local function message(text)
+        lastMessage=text
+        if state.running then
+            status:SetDesc(text)
+            totals:SetDesc("Harvested: "..farm.harvested.." | Planted: "..farm.planted.." | Pending replants: "..#farm.queue)
+        end
+    end
+    local function ownBlocks()
+        local islands=workspace:FindFirstChild("Islands")
+        for _, island in ipairs(islands and islands:GetChildren() or {}) do
+            local owners=island:FindFirstChild("Owners")
+            if owners and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then return island:FindFirstChild("Blocks") end
+        end
+    end
+    local function partOf(block)
+        if block:IsA("BasePart") then return block end
+        return block:FindFirstChildWhichIsA("BasePart",true)
+    end
+    local function ready(block)
+        local flag=block:FindFirstChild("Harvestable",true)
+        return flag and flag:IsA("BoolValue") and flag.Value==true
+    end
+    local function selected(block)
+        return farm.selected[block.Name] or (farm.selected.all and cropSet[block.Name])
+    end
+    local function inventory()
+        local found={}
+        local backpack=LocalPlayer:FindFirstChild("Backpack")
+        for _, container in pairs({backpack,LocalPlayer.Character}) do
+            for _, tool in ipairs(container:GetChildren()) do
+                if tool:IsA("Tool") then found[tool.Name]=tool end
+            end
+        end
+        return found
+    end
+    local function seedCrop(tool)
+        if not tool or not tool:FindFirstChild("seeds") then return nil end
+        local name=tool.Name:gsub("Seeds$", "")
+        if name=="spirit" then name="spiritCrop" end
+        return cropSet[name] and name~="all" and name or nil
+    end
+    local function hasSeed(name)
+        for _,tool in pairs(inventory()) do if seedCrop(tool)==name then return true end end
+        return false
+    end
+    local function occupied(blocks, position)
+        for _, block in ipairs(blocks:GetChildren()) do
+            local part=partOf(block)
+            if part and (part.Position-position).Magnitude<1 then return block end
+        end
+    end
+    stopFarming = function(reason)
+        farm.mode=nil; farm.version=farm.version+1; state.cropDestination=nil
+        changingMode=true
+        for _,toggle in pairs(toggles) do if toggle.Value then toggle:SetValue(false) end end
+        changingMode=false
+        restoreMovement()
+        message(reason or "Off")
+    end
+    local function setMode(mode, value)
+        if changingMode then return end
+        if not value then if farm.mode==mode then stopFarming() end;return end
+        stopFarming()
+        farmToggle:SetValue(false); auraToggle:SetValue(false); stopCutting()
+        if stopAutoBuild then stopAutoBuild("Stopped: farming enabled.") end
+        farm.mode=mode; farm.version=farm.version+1
+        -- Keep the active toggle on after stopFarming cleared the previous mode.
+        changingMode=true
+        toggles[mode]:SetValue(true)
+        changingMode=false
+        message(mode=="plant" and "Planting held seeds on nearby empty soil." or "Scanning your island for ripe crops.")
+    end
+    -- A timed-out InvokeServer stays tracked until it finishes: never stack requests.
+    local function invoke(remote, args, current)
+        assert(not pending or pending.done,"Previous crop request is still waiting for the server. Retry after it finishes.")
+        if not current() then return false end
+        local request={done=false}; pending=request
+        task.spawn(function()
+            request.ok,request.result=pcall(function()
+                if current() then return remote:InvokeServer(table.unpack(args)) end
+            end)
+            request.done=true
+        end)
+        local deadline=os.clock()+8
+        while not request.done do
+            if not current() then return false end
+            assert(os.clock()<deadline,"Crop request timed out; further requests stopped. Save Crop Diagnostic.")
+            task.wait(0.05)
+        end
+        if not current() then return false end
+        assert(request.ok,tostring(request.result))
+        assert(request.result~=false,"Server rejected the crop request. Save Crop Diagnostic.")
+        return true
+    end
+    local function moveNear(position, root)
+        if farm.mode=="auto" then state.cropDestination=position+Vector3.new(0,3,5) end
+        return (root.Position-position).Magnitude<=farm.range
+    end
+    local function place(record, blocks, current)
+        if occupied(blocks,record.cf.Position) then return true end
+        assert(hasSeed(record.name),"No "..record.name.." seeds found in your hotbar. Replant is waiting.")
+        local remote,key,hashValue=resolveCropPlacement()
+        if not current() then return false end
+        if not invoke(remote,{{[key]=hashValue,cframe=record.cf,blockType=record.name,upperBlock=false}},current) then return false end
+        local deadline=os.clock()+2
+        repeat
+            local block=occupied(blocks,record.cf.Position)
+            if block then
+                if block.Name==record.name then farm.planted=farm.planted+1 end
+                return true
+            end
+            if not current() then return false end
+            task.wait(0.1)
+        until os.clock()>=deadline
+        error("Planting "..record.name.." was not confirmed. Check seeds and soil; Save Crop Diagnostic.")
+    end
+    local function runOnce()
+        local character,humanoid,root=getCharacter()
+        if not character then message("Waiting for your character.");return end
+        local blocks=ownBlocks()
+        if not blocks then message("Your island's blocks are not loaded.");state.cropDestination=nil;return end
+        local token=farm.version
+        local function current()
+            return state.running and farm.mode~=nil and farm.version==token and LocalPlayer.Character==character
+                and humanoid.Health>0 and blocks.Parent~=nil
+        end
+        assert(not pending or pending.done,"Previous crop request is still pending. Wait, then enable farming again.")
+        if farm.mode=="plant" then
+            local name=seedCrop(character:FindFirstChildOfClass("Tool"))
+            assert(name,"Hold a supported seed tool to use Crop Place Aura (including spirit seeds).")
+            for _,soil in ipairs(blocks:GetChildren()) do
+                if soil.Name=="soil" then
+                    local part=partOf(soil)
+                    if part then
+                        local position=part.Position+Vector3.new(0,3,0)
+                        if (root.Position-position).Magnitude<=farm.range and not occupied(blocks,position) then
+                            message("Planting "..name)
+                            place({name=name,cf=CFrame.new(position)},blocks,current)
+                            return
+                        end
+                    end
+                end
+            end
+            message("No empty soil within "..farm.range.." studs.");return
+        end
+        -- Queued records survive Stop/Resume; never replace a crop that still exists.
+        while #farm.queue>0 do
+            local record=farm.queue[1]
+            if record.blocks~=blocks then error("Pending replants belong to another island. Clear Pending Replants before switching islands.") end
+            if record.block.Parent~=blocks then
+                if not record.counted then farm.harvested=farm.harvested+1;record.counted=true end
+                if farm.replant then
+                    if not moveNear(record.cf.Position,root) then message("Moving to replant "..record.name);return end
+                    message("Replanting "..record.name)
+                    if not place(record,blocks,current) then return end
+                end
+            elseif not ready(record.block) and not record.counted then
+                farm.harvested=farm.harvested+1;record.counted=true
+            end
+            table.remove(farm.queue,1)
+        end
+        local candidates={}
+        for _,block in ipairs(blocks:GetChildren()) do
+            local part=partOf(block)
+            if selected(block) and part and ready(block) then
+                local distance=(root.Position-part.Position).Magnitude
+                if farm.mode=="auto" or distance<=farm.range then
+                    table.insert(candidates,{block=block,blocks=blocks,name=block.Name,cf=part.CFrame,distance=distance})
+                end
+            end
+        end
+        table.sort(candidates,function(a,b) return a.distance<b.distance end)
+        if #candidates==0 then state.cropDestination=nil;message("Waiting for selected crops to ripen"..(farm.mode=="aura" and " within range." or "."));return end
+        if not moveNear(candidates[1].cf.Position,root) then message("Moving to "..candidates[1].name);return end
+        local tools=inventory(); local sickle
+        for _,name in ipairs(sickles) do if tools[name] then sickle=tools[name];break end end
+        assert(sickle,"No sickle found. Put sickleStone, sickleIron, or sickleDiamond in your hotbar.")
+        if sickle.Parent~=character then humanoid:EquipTool(sickle);task.wait(0.2) end
+        if not current() then return end
+        assert(sickle.Parent==character,"Could not equip "..sickle.Name)
+        local remote=netManaged():FindFirstChild("SwingSickle")
+        assert(remote and remote:IsA("RemoteFunction"),"SwingSickle RemoteFunction not found. Save Crop Diagnostic.")
+        -- Resolve placement before harvesting so an unknown hash cannot strand a batch.
+        if farm.replant then resolveCropPlacement() end
+        if not current() then return end
+        local batch={}
+        for _,record in ipairs(candidates) do
+            if #batch>=farm.batch then break end
+            if record.distance<=farm.range and record.block.Parent==blocks and ready(record.block) then
+                table.insert(batch,record.block);table.insert(farm.queue,record)
+            end
+        end
+        message("Harvesting "..#batch.." crops with "..sickle.Name)
+        if not invoke(remote,{sickle.Name,batch},current) then return end
+        local deadline=os.clock()+2
+        while current() and os.clock()<deadline do
+            local changed=false
+            for _,record in ipairs(farm.queue) do if record.block.Parent~=blocks or not ready(record.block) then changed=true;break end end
+            if changed then return end
+            task.wait(0.1)
+        end
+        if current() then error("Harvest was not confirmed. Try the sickle manually, then Save Crop Diagnostic.") end
+    end
+    local section=Farming:AddSection("Crop Farm")
+    local selection=section:AddDropdown("CropSelection",{Title="Crop to Farm",Values=crops,Multi=true,Default={"spiritCrop"}})
+    selection:OnChanged(function(value)
+        farm.selected={}
+        for name,enabled in pairs(value) do if enabled then farm.selected[name]=true end end
+        farm.version=farm.version+1;state.cropDestination=nil
+    end)
+    for _,option in ipairs({{"auto","Crop Auto Farm"},{"aura","Crop Aura (No Movement)"},{"plant","Crop Place Aura (Held Seeds)"}}) do
+        local mode=option[1]
+        toggles[mode]=section:AddToggle("CropMode_"..mode,{Title=option[2],Default=false})
+        toggles[mode]:OnChanged(function(value) setMode(mode,value) end)
+    end
+    section:AddToggle("CropReplant",{Title="Auto Replace Crop",Default=true}):OnChanged(function(value) farm.replant=value end)
+    section:AddSlider("CropRange",{Title="Crop Range",Default=20,Min=8,Max=30,Rounding=0,Callback=function(v) farm.range=v end})
+    section:AddSlider("CropInterval",{Title="Harvest Interval (seconds)",Default=2,Min=0.5,Max=15,Rounding=1,Callback=function(v) farm.interval=v end})
+    section:AddSlider("CropBatch",{Title="Crops per Harvest",Default=10,Min=1,Max=30,Rounding=0,Callback=function(v) farm.batch=v end})
+    section:AddButton({Title="Stop Farming",Callback=function() stopFarming() end})
+    section:AddButton({Title="Clear Pending Replants",Callback=function() stopFarming();farm.queue={};message("Pending replants cleared.") end})
+    section:AddButton({Title="Save Crop Diagnostic",Callback=function()
+        local ok,err=pcall(function()
+            local lines={"RoSnipe crop diagnostic", "PlaceId="..game.PlaceId.." PlaceVersion="..game.PlaceVersion,
+                "Mode="..tostring(farm.mode).." Status="..tostring(lastMessage),"Pending replants="..#farm.queue}
+            local function log(v) table.insert(lines,v) end
+            for name,tool in pairs(inventory()) do log("Tool="..name.." SeedCrop="..tostring(seedCrop(tool))) end
+            local blocks=ownBlocks(); local counts={}
+            for _,block in ipairs(blocks and blocks:GetChildren() or {}) do
+                if cropSet[block.Name] then
+                    counts[block.Name]=counts[block.Name] or {total=0,ripe=0}
+                    local count=counts[block.Name];count.total=count.total+1;if ready(block) then count.ripe=count.ripe+1 end
+                end
+            end
+            log("Crops="..HttpService:JSONEncode(counts))
+            for _,name in ipairs({"SwingSickle","CLIENT_HARVEST_CROP_REQUEST","CLIENT_BLOCK_PLACE_REQUEST"}) do
+                local remote=netManaged():FindFirstChild(name);log(name.."="..(remote and remote.ClassName or "missing"))
+            end
+            local info=getinfo or (debug and debug.getinfo)
+            local constants=getconstants or (debug and debug.getconstants)
+            local protos=getprotos or (debug and debug.getprotos)
+            local visited,count={},0
+            local function dump(fn,depth)
+                if visited[fn] or count>=60 then return end
+                visited[fn]=true;count=count+1
+                local details=info(fn);log("Function="..tostring(details.name).." Source="..tostring(details.source))
+                local values=constants(fn)
+                for i=1,160 do
+                    local v=values[i]
+                    if type(v)=="string" then log(" constant["..i.."]="..string.format("%q",v))
+                    elseif v~=nil then log(" constant["..i.."]="..(type(v)=="number" and tostring(v) or "<"..type(v)..">")) end
+                end
+                if depth<2 and type(protos)=="function" then for _,child in pairs(protos(fn)) do pcall(dump,child,depth+1) end end
+            end
+            if type(getgc)=="function" and type(info)=="function" and type(constants)=="function" then
+                for _,fn in pairs(getgc(true)) do
+                    if type(fn)=="function" then pcall(function()
+                        local d=info(fn);local source=tostring(d.source or d.short_src)
+                        if source:find("crop-service",1,true) or source:lower():find("sickle",1,true) then dump(fn,0) end
+                    end) end
+                end
+            end
+            assert(type(writefile)=="function","Executor writefile is unavailable.")
+            writefile("islands-crop-diagnostic.txt",table.concat(lines,"\n"))
+        end)
+        message(ok and "Saved islands-crop-diagnostic.txt in your executor workspace." or ("Diagnostic error: "..tostring(err)))
+    end})
+    task.spawn(function()
+        while state.running do
+            if farm.mode then
+                local token=farm.version
+                local ok,err=pcall(runOnce)
+                if not ok and token==farm.version then stopFarming("Farming error: "..tostring(err)) end
+            end
+            task.wait(farm.mode and farm.interval or 0.25)
+        end
+    end)
+end
+installFarming()
+
 local function shutdown()
     if not state.running then return end
+    if stopFarming then stopFarming() end
     state.running = false
     if stopAutoBuild then stopAutoBuild(nil, true) end
     state.autoFarm, state.killAura = false, false
@@ -2289,6 +2595,7 @@ table.insert(connections, UserInputService.WindowFocused:Connect(function()
     windowFocused = true
 end))
 table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
+    if stopFarming then stopFarming("Stopped: character respawning.") end
     if stopAutoBuild then stopAutoBuild("Stopped: character respawning.") end
     stopCombat()
     tokenTracker.previous = nil
@@ -2317,7 +2624,9 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
         restoreRageblade()
     end
     local destination
-    if state.treeFarm and validTreeTarget(state.treeTarget) then
+    if state.cropDestination then
+        destination = state.cropDestination
+    elseif state.treeFarm and validTreeTarget(state.treeTarget) then
         -- Cutting stands beside the trunk; the -10 offset belongs to Combat only.
         destination = state.treeTarget.trunk.Position + Vector3.new(0, 0, 6)
     elseif state.autoFarm then
