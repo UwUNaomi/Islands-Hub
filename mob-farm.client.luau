@@ -842,9 +842,18 @@ local function treeMatches(tree)
     return string.match(tree.Name, treePatterns[state.treeType]) ~= nil
 end
 
+local function treeHitPart(tree)
+    local trunk=tree:FindFirstChild("trunk",true)
+    if trunk and trunk:IsA("BasePart") then return trunk end
+    -- The original supports trees whose hit part is a mesh instead of "trunk".
+    local mesh=tree:FindFirstChildWhichIsA("MeshPart",true)
+    if mesh then return mesh end
+    if tree:IsA("BasePart") then return tree end
+end
+
 local function validTreeTarget(target)
     return target and target.tree.Parent == target.parent and target.parent:IsDescendantOf(workspace)
-        and target.trunk:IsDescendantOf(target.tree) and treeMatches(target.tree)
+        and (target.trunk==target.tree or target.trunk:IsDescendantOf(target.tree)) and treeMatches(target.tree)
 end
 
 local function detectTreeAxe(character)
@@ -867,14 +876,17 @@ local function findTreeTarget(root)
         end
     end
     local islands = workspace:FindFirstChild("Islands")
-    if not islands then return nil end
+    if not islands then return nil,"No island blocks are loaded yet." end
     local nearest, best = nil, state.treeFarm and math.huge or state.treeRange
+    local matched,withPart=0,0
+    local scope="loaded islands"
     -- Prefer your owned island; otherwise use the loaded islands, as the input script does.
     local candidates = islands:GetChildren()
     for _, island in ipairs(candidates) do
         local owners = island:FindFirstChild("Owners")
         if owners and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then
             candidates = { island }
+            scope="your island"
             break
         end
     end
@@ -882,17 +894,24 @@ local function findTreeTarget(root)
         local blocks = island:FindFirstChild("Blocks")
         if blocks then
             for _, tree in ipairs(blocks:GetChildren()) do
-                local trunk = treeMatches(tree) and tree:FindFirstChild("trunk")
-                if trunk and trunk:IsA("BasePart") then
-                    local distance = (root.Position - trunk.Position).Magnitude
-                    if distance <= best then
-                        nearest, best = { tree = tree, trunk = trunk, parent = blocks }, distance
+                if treeMatches(tree) then
+                    matched=matched+1
+                    local trunk = treeHitPart(tree)
+                    if trunk then
+                        withPart=withPart+1
+                        local distance = (root.Position - trunk.Position).Magnitude
+                        if distance <= best then
+                            nearest, best = { tree = tree, trunk = trunk, parent = blocks }, distance
+                        end
                     end
                 end
             end
         end
     end
-    return nearest
+    if nearest then return nearest end
+    if matched==0 then return nil,"No "..state.treeType.." trees loaded on "..scope.."." end
+    if withPart==0 then return nil,"Found "..matched.." "..state.treeType.." trees, but no trunk or mesh hit parts." end
+    return nil,"Found "..withPart.." "..state.treeType.." trees outside the "..state.treeRange.."-stud aura range. Move closer or enable Tree Auto Farm."
 end
 
 local function resolveTreeCombat()
@@ -975,9 +994,9 @@ local function runTreeOnce()
     end
     if not current() then return end
     if axe.Parent ~= character or not axe.Enabled then setTreeStatus("Waiting for the axe to be ready.") return end
-    local target = findTreeTarget(root)
+    local target,reason = findTreeTarget(root)
     state.treeTarget = target
-    if not target then setTreeStatus("No " .. state.treeType .. " trees with a trunk found in range.") return end
+    if not target then setTreeStatus(reason) return end
     if (root.Position - target.trunk.Position).Magnitude > state.treeRange then
         setTreeStatus("Moving to " .. target.tree.Name .. " with " .. axe.Name .. ".")
         return
