@@ -282,21 +282,41 @@ local function resolveCombat()
             end
         end
     end
+    local ownedCandidates, sourceCandidates = {}, {}
     for _, closure in pairs(getgc(true)) do
         if type(closure) == "function" then
-            local inspected, match = pcall(function()
+            pcall(function()
                 local details = info(closure)
-                local source = type(details) == "table" and (details.source or details.short_src)
-                -- Both Backpack.swordWood.sword and Workspace.<player>.swordWood.sword
-                -- appeared in the report. Exclude our own executor functions.
-                if type(source) ~= "string" or not string.find(source, "." .. weapon.Name .. ".", 1, true) then
-                    return nil
+                if type(details) ~= "table" then return end
+                local source = details.source or details.short_src
+                -- Cloned weapon scripts can retain another weapon's debug source.
+                -- The live script instance identifies the actual equipped weapon.
+                local scriptKnown, belongsToWeapon = false, false
+                if type(getfenv) == "function" then
+                    pcall(function()
+                        local environment = getfenv(closure)
+                        local scriptObject = type(environment) == "table" and rawget(environment, "script")
+                        if typeof(scriptObject) == "Instance" then
+                            scriptKnown = true
+                            belongsToWeapon = scriptObject:IsDescendantOf(weapon)
+                        end
+                    end)
                 end
-                return inspectSender(closure, details.name == "attemptHit" and 0 or 2)
+                local candidate = { fn = closure, depth = details.name == "attemptHit" and 0 or 2 }
+                if belongsToWeapon then
+                    table.insert(ownedCandidates, candidate)
+                elseif not scriptKnown and type(source) == "string"
+                    and string.find(source, "." .. weapon.Name .. ".", 1, true) then
+                    -- Compatibility fallback only when script ownership is unavailable.
+                    table.insert(sourceCandidates, candidate)
+                end
             end)
-            if inspected and match then
-                return match, weapon
-            end
+        end
+    end
+    for _, candidates in ipairs({ ownedCandidates, sourceCandidates }) do
+        for _, candidate in ipairs(candidates) do
+            local inspected, match = pcall(inspectSender, candidate.fn, candidate.depth)
+            if inspected and match then return match, weapon end
         end
     end
     error("No compatible melee hit sender found for " .. weapon.Name
