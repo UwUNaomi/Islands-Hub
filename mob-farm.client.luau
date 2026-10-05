@@ -2277,13 +2277,13 @@ installAutoBuild()
 local function installFarming()
     local farm = { mode=nil, selected={spiritCrop=true}, range=20, interval=2, batch=10,
         replant=true, version=0, queue={}, harvested=0, planted=0 }
-    local sickles = {"sickleDiamond", "sickleIron", "sickleStone"}
+    local sickles = {"cletusSickle", "sickleDiamond", "sickleIron", "sickleStone"}
     local crops = {"all", "spiritCrop", "wheat", "carrot", "potato", "onion", "tomato",
         "spinach", "pumpkin", "melon", "pineapple", "starfruit", "dragonfruit",
         "chiliPepper", "grapeVine", "candyCaneVine", "berryBush", "blackberryBush", "blueberryBush"}
     local cropSet = {}
     for _, name in ipairs(crops) do cropSet[name]=true end
-    local status = Farming:AddParagraph({Title="Farming Status", Content="Select crops and enable a farm. Requires a stone, iron, or diamond sickle in your hotbar."})
+    local status = Farming:AddParagraph({Title="Farming Status", Content="Select crops and enable a farm. Requires a Cletus, stone, iron, or diamond sickle in your hotbar."})
     local totals = Farming:AddParagraph({Title="Session Totals", Content="Harvested: 0 | Planted: 0"})
     local toggles, pending = {}, nil
     local changingMode=false
@@ -2464,7 +2464,7 @@ local function installFarming()
         if not moveNear(candidates[1].cf.Position,root) then message("Moving to "..candidates[1].name);return end
         local tools=inventory(); local sickle
         for _,name in ipairs(sickles) do if tools[name] then sickle=tools[name];break end end
-        assert(sickle,"No sickle found. Put sickleStone, sickleIron, or sickleDiamond in your hotbar.")
+        assert(sickle,"No sickle found. Put cletusSickle, sickleStone, sickleIron, or sickleDiamond in your hotbar.")
         if sickle.Parent~=character then humanoid:EquipTool(sickle);task.wait(0.2) end
         if not current() then return end
         assert(sickle.Parent==character,"Could not equip "..sickle.Name)
