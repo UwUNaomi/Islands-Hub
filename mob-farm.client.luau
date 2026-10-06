@@ -48,6 +48,7 @@ local Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
 local state = {
     running = true,
     autoFarm = false,
+    bossFarm = false,
     killAura = false,
     rageblade = false,
     weapon = nil,
@@ -78,6 +79,7 @@ local treeFarmToggle, treeAuraToggle
 local stopCutting
 local stopAutoBuild
 local stopFarming, resolveCropPlacement
+local stopBossFarm, runBossOnce, setBossStatus
 local generation = 0
 local combatRequests = 0
 local activeCombatActivation
@@ -169,6 +171,7 @@ local function stopCombat()
     releaseCombatActivation()
     state.target = nil
     state.treeTarget = nil
+    state.bossDestination = nil
     restoreMovement()
     restoreRageblade()
 end
@@ -337,7 +340,7 @@ local function refreshCombat()
     -- Selection, respawn, or disabling combat can invalidate an in-flight lookup.
     if not state.running then return end
     if token ~= generation then
-        if (state.autoFarm or state.killAura) and selectedCombatTool() then task.defer(refreshCombat) end
+        if (state.autoFarm or state.bossFarm or state.killAura) and selectedCombatTool() then task.defer(refreshCombat) end
         return
     end
     if ok and weapon == selectedCombatTool() then
@@ -465,7 +468,8 @@ local function runCombatClick()
     if pause then setClickStatus(pause) return end
     local character = getCharacter()
     if not character then return end
-    local mob = state.autoFarm and state.target or findAuraSlime()
+    local mob
+    if state.autoFarm or state.bossFarm then mob=state.target else mob=findAuraSlime() end
     if not mob or not mob.Parent then setClickStatus("Waiting for a mob.") return end
     local health = mob:FindFirstChildOfClass("Humanoid")
     if not health or health.Health <= 0 then return end
@@ -513,7 +517,7 @@ local function attack(mob, farm)
         if not state.running or token ~= generation or resolving or not mob.Parent
             or not humanoid or humanoid.Health <= 0 or not mob:FindFirstChild("HumanoidRootPart")
             or LocalPlayer.Character ~= character or tool.Parent ~= character or tool ~= combatWeapon
-            or (farm and not state.autoFarm) or (not farm and not state.killAura) then
+            or (farm and not state.autoFarm and not state.bossFarm) or (not farm and not state.killAura) then
             break
         end
         if not windowFocused or GuiService.MenuIsOpen or UserInputService:GetFocusedTextBox() then return end
@@ -724,7 +728,7 @@ local inventorySignature, lastWeaponInstance, lastWeaponMessage
 local function invalidateWeapon()
     stopCombat()
     combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
-    if (state.autoFarm or state.killAura) and selectedCombatTool() then task.spawn(refreshCombat) end
+    if (state.autoFarm or state.bossFarm or state.killAura) and selectedCombatTool() then task.spawn(refreshCombat) end
 end
 local function refreshWeaponInventory()
     local names, found, equipped = scanCombatInventory()
@@ -805,6 +809,7 @@ MobSection:AddSlider("MobHeight", {
 farmToggle = MobSection:AddToggle("MobAutoFarmToggle", { Title = "Mob Auto Farm", Default = false })
 farmToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopBossFarm then stopBossFarm() end
     if value and stopCutting then stopCutting() end
     if value and stopFarming then stopFarming() end
     state.autoFarm = value
@@ -814,6 +819,7 @@ end)
 auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Auto Click + Remote)", Default = false })
 auraToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopBossFarm then stopBossFarm() end
     if value and stopCutting then stopCutting() end
     if value and stopFarming then stopFarming() end
     state.killAura = value
@@ -836,7 +842,7 @@ rageToggle:OnChanged(function(value)
     state.rageblade = value
     stopCombat()
     combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
-    if state.autoFarm or state.killAura then task.spawn(refreshCombat) end
+    if state.autoFarm or state.bossFarm or state.killAura then task.spawn(refreshCombat) end
 end)
 
 -- Cutting uses CLIENT_BLOCK_HIT_REQUEST with the current axe-tool hash layout.
@@ -1092,6 +1098,7 @@ stopCutting = function()
     setTreeStatus("Off")
 end
 local function setCuttingMode(mode, value)
+    if value and stopBossFarm then stopBossFarm() end
     if value and stopFarming then stopFarming() end
     if value and stopAutoBuild then stopAutoBuild("Stopped: cutting enabled.") end
     state[mode] = value
@@ -1718,6 +1725,7 @@ local function installAutoBuild()
     end
     stopAutoBuild = stop
     local function stopFarms()
+        if stopBossFarm then stopBossFarm() end
         if stopFarming then stopFarming() end
         farmToggle:SetValue(false)
         auraToggle:SetValue(false)
@@ -2351,6 +2359,7 @@ local function installFarming()
         if changingMode then return end
         if not value then if farm.mode==mode then stopFarming() end;return end
         stopFarming()
+        if stopBossFarm then stopBossFarm() end
         farmToggle:SetValue(false); auraToggle:SetValue(false); stopCutting()
         if stopAutoBuild then stopAutoBuild("Stopped: farming enabled.") end
         farm.mode=mode; farm.version=farm.version+1
@@ -2568,8 +2577,149 @@ local function installFarming()
 end
 installFarming()
 
+-- Try the original summon trigger first; no replacement summon remote is assumed.
+local function installBossFarm()
+    local boss = { autoSpawn=true, retry=15, nextSpawn=0, attempts=0, message="Off" }
+    local section=Main:AddSection("Slime King")
+    local status=section:AddParagraph({Title="Boss Status",Content="Uses the original slime_king_spawn prompt. Select your weapon above; hide RoSnipe with Right Shift for automatic clicks."})
+    local toggle
+    setBossStatus=function(message)
+        boss.message=message
+        if state.running then status:SetDesc(message) end
+    end
+    local function findBoss()
+        local wilderness=workspace:FindFirstChild("WildernessIsland")
+        local entities=wilderness and wilderness:FindFirstChild("Entities")
+        if not entities then return nil,nil end
+        for _,entity in ipairs(entities:GetChildren()) do
+            if entity.Name=="slimeKing" then
+                local health=entity:FindFirstChildOfClass("Humanoid")
+                local root=entity:FindFirstChild("HumanoidRootPart")
+                if health and health.Health>0 and root then return entity,entities end
+            end
+        end
+        return nil,entities
+    end
+    local function oldTrigger()
+        local prefabs=workspace:FindFirstChild("spawnPrefabs")
+        local triggers=prefabs and prefabs:FindFirstChild("WildEventTriggers")
+        local trigger=triggers and triggers:FindFirstChild("slime_king_spawn")
+        local prompt=trigger and trigger:FindFirstChild("ProximityPrompt")
+        return trigger,prompt,triggers
+    end
+    stopBossFarm=function(reason)
+        state.bossFarm=false;state.bossDestination=nil
+        if toggle and toggle.Value then toggle:SetValue(false) end
+        stopCombat()
+        setBossStatus(reason or "Off")
+    end
+    runBossOnce=function()
+        if not state.bossFarm then return end
+        local character,humanoid,root=getCharacter()
+        if not character then setBossStatus("Waiting for your character.");return end
+        local target,entities=findBoss()
+        state.target=target;state.bossDestination=nil
+        if not entities then setBossStatus("WildernessIsland.Entities is not loaded. Travel to the Slime King island.");return end
+        if not combatRemote then setBossStatus("Combat lookup is unresolved. Check Combat Status and Refresh Combat Remotes.");return end
+        if target then
+            local health=target:FindFirstChildOfClass("Humanoid")
+            setBossStatus("Fighting slimeKing | health "..tostring(health.Health))
+            if (target.HumanoidRootPart.Position-root.Position).Magnitude<=math.max(20,math.abs(state.height)+5) then attack(target,true) end
+            return
+        end
+        if not boss.autoSpawn then setBossStatus("Waiting for Slime King. Enable Boss Auto Spawn to summon it.");return end
+        local trigger,prompt=oldTrigger()
+        assert(trigger and trigger:IsA("BasePart"),"Original slime_king_spawn part not found. Save Boss Diagnostic.")
+        assert(prompt and prompt:IsA("ProximityPrompt"),"Original Slime King ProximityPrompt not found. Save Boss Diagnostic.")
+        assert(type(fireproximityprompt)=="function","Executor has no fireproximityprompt. Save Boss Diagnostic.")
+        if not prompt.Enabled then setBossStatus("Summon prompt is disabled; waiting for the game to enable it.");return end
+        local activationRange=math.max(0,prompt.MaxActivationDistance)
+        if activationRange<=0 then setBossStatus("Summon prompt has no activation range. Save Boss Diagnostic.");return end
+        -- Use the hub's existing movement mode to reach the original trigger.
+        state.bossDestination=trigger.Position
+        if (root.Position-trigger.Position).Magnitude>activationRange then
+            setBossStatus("Moving to the original Slime King summon trigger.");return
+        end
+        local remaining=boss.nextSpawn-os.clock()
+        if remaining>0 then
+            setBossStatus("Waiting for spawn / game cooldown (retry in "..math.ceil(remaining).."s). Attempts: "..boss.attempts)
+            return
+        end
+        local token=generation
+        if not state.running or not state.bossFarm or LocalPlayer.Character~=character or humanoid.Health<=0 then return end
+        -- Reserve the interval before calling, even if the executor yields or throws.
+        boss.nextSpawn=os.clock()+boss.retry;boss.attempts=boss.attempts+1
+        fireproximityprompt(prompt)
+        if state.running and state.bossFarm and generation==token then
+            setBossStatus("Original summon prompt triggered (attempt "..boss.attempts.."). Waiting for Slime King; game requirements still apply.")
+        end
+    end
+    toggle=section:AddToggle("BossAutoFarm",{Title="Boss Auto Farm (Slime King)",Default=false})
+    toggle:OnChanged(function(value)
+        if not value then if state.bossFarm then stopBossFarm() end;return end
+        farmToggle:SetValue(false);auraToggle:SetValue(false)
+        if stopCutting then stopCutting() end
+        if stopFarming then stopFarming() end
+        if stopAutoBuild then stopAutoBuild("Stopped: boss farming enabled.") end
+        state.bossFarm=true;boss.nextSpawn=0;boss.attempts=0
+        stopCombat();setBossStatus("Starting Slime King farm with the original summon trigger.")
+        if not combatRemote or combatWeapon~=selectedCombatTool() then task.spawn(refreshCombat) end
+    end)
+    section:AddToggle("BossAutoSpawn",{Title="Boss Auto Spawn",Default=true}):OnChanged(function(value)
+        boss.autoSpawn=value
+        if not value then state.bossDestination=nil end
+    end)
+    section:AddSlider("BossSpawnRetry",{Title="Summon Retry Interval (seconds)",Default=15,Min=5,Max=120,Rounding=0,Callback=function(value) boss.retry=value end})
+    section:AddButton({Title="Stop Boss Farm",Callback=function() stopBossFarm() end})
+    section:AddButton({Title="Save Boss Diagnostic",Callback=function()
+        local ok,err=pcall(function()
+            local character,_,root=getCharacter()
+            local target,entities=findBoss()
+            local trigger,prompt,triggers=oldTrigger()
+            local lines={"RoSnipe boss diagnostic (original trigger)","PlaceId="..game.PlaceId.." PlaceVersion="..game.PlaceVersion,
+                "Status="..boss.message,"BossAutoFarm="..tostring(state.bossFarm).." AutoSpawn="..tostring(boss.autoSpawn),
+                "Summon attempts="..boss.attempts.." fireproximityprompt="..type(fireproximityprompt),
+                "Selected weapon="..tostring(state.weapon).." Combat resolved="..tostring(combatRemote~=nil),
+                "Player position="..tostring(root and root.Position),"Living slimeKing="..tostring(target~=nil),
+                "Entities loaded="..tostring(entities~=nil),"Trigger="..(trigger and trigger:GetFullName() or "missing")}
+            local function log(message) table.insert(lines,message) end
+            local equipped=character and character:FindFirstChildOfClass("Tool")
+            log("Equipped="..(equipped and equipped.Name or "none"))
+            if trigger then
+                log("Trigger class="..trigger.ClassName)
+                if trigger:IsA("BasePart") and root then log("Trigger distance="..tostring((trigger.Position-root.Position).Magnitude)) end
+                for i,child in ipairs(trigger:GetDescendants()) do
+                    if i>100 then break end
+                    log("Trigger child="..child:GetFullName().." ["..child.ClassName.."]")
+                    if child:IsA("ProximityPrompt") then
+                        log("Prompt Enabled="..tostring(child.Enabled).." Range="..child.MaxActivationDistance.." Hold="..child.HoldDuration
+                            .." RequiresLineOfSight="..tostring(child.RequiresLineOfSight).." Action="..child.ActionText.." Object="..child.ObjectText)
+                    end
+                end
+            end
+            for i,child in ipairs(triggers and triggers:GetChildren() or {}) do
+                if i>100 then break end
+                log("WildEventTrigger="..child.Name.." ["..child.ClassName.."]")
+            end
+            for _,entity in ipairs(entities and entities:GetChildren() or {}) do
+                if entity.Name:lower():find("slime",1,true) then
+                    local health=entity:FindFirstChildOfClass("Humanoid")
+                    log("Entity="..entity.Name.." Health="..tostring(health and health.Health))
+                end
+            end
+            local tokens,source=readTokenBalance()
+            log("slimeKingToken balance="..tostring(tokens).." Source="..tostring(source))
+            assert(type(writefile)=="function","Executor writefile is unavailable.")
+            writefile("islands-boss-diagnostic.txt",table.concat(lines,"\n"))
+        end)
+        setBossStatus(ok and "Saved islands-boss-diagnostic.txt in your executor workspace." or ("Diagnostic error: "..tostring(err)))
+    end})
+end
+installBossFarm()
+
 local function shutdown()
     if not state.running then return end
+    if stopBossFarm then stopBossFarm() end
     if stopFarming then stopFarming() end
     state.running = false
     if stopAutoBuild then stopAutoBuild(nil, true) end
@@ -2595,6 +2745,7 @@ table.insert(connections, UserInputService.WindowFocused:Connect(function()
     windowFocused = true
 end))
 table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
+    if stopBossFarm then stopBossFarm("Stopped: character respawning.") end
     if stopFarming then stopFarming("Stopped: character respawning.") end
     if stopAutoBuild then stopAutoBuild("Stopped: character respawning.") end
     stopCombat()
@@ -2608,7 +2759,7 @@ table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
     tokenTracker.rebaseUntil = os.clock() + 2
     combatRemote, combatKey, combatHash, combatWeapon = nil, nil, nil, nil
     treeRemote, treeHashKey, treeHashValue = nil, nil, nil
-    if state.autoFarm or state.killAura then
+    if state.autoFarm or state.bossFarm or state.killAura then
         task.delay(1, refreshCombat)
     end
 end))
@@ -2617,7 +2768,7 @@ end))
 table.insert(connections, RunService.Heartbeat:Connect(function(dt)
     if Fluent.Unloaded then shutdown() return end
     local character, humanoid, root = getCharacter()
-    if rageData and state.rageblade and state.weapon == "rageblade" and state.autoFarm
+    if rageData and state.rageblade and state.weapon == "rageblade" and (state.autoFarm or state.bossFarm)
         and character and rageTool and rageTool.Parent == character then
         rageData.lastClicked = 0
     elseif rageData then
@@ -2629,7 +2780,9 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
     elseif state.treeFarm and validTreeTarget(state.treeTarget) then
         -- Cutting stands beside the trunk; the -10 offset belongs to Combat only.
         destination = state.treeTarget.trunk.Position + Vector3.new(0, 0, 6)
-    elseif state.autoFarm then
+    elseif state.bossFarm and state.bossDestination then
+        destination = state.bossDestination
+    elseif state.autoFarm or state.bossFarm then
         local target = state.target
         local targetRoot = target and target.Parent and target:FindFirstChild("HumanoidRootPart")
         local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
@@ -2666,9 +2819,11 @@ end))
 
 task.spawn(function()
     while state.running do
-        if not resolving and combatRemote and state.autoFarm then
+        if not resolving and (state.bossFarm or (combatRemote and state.autoFarm)) then
             local ok, err = pcall(function()
-                if state.autoFarm then
+                if state.bossFarm then
+                    runBossOnce()
+                elseif state.autoFarm then
                     state.target = findNearestMob(true)
                     if state.target then attack(state.target, true) end
                 else
@@ -2676,6 +2831,7 @@ task.spawn(function()
                 end
             end)
             if not ok then
+                if state.bossFarm then stopBossFarm("Boss error: "..tostring(err)) end
                 state.autoFarm = false
                 stopCombat()
                 farmToggle:SetValue(false)
@@ -2703,7 +2859,7 @@ end)
 -- One click worker serves both combat modes; remote attacks never wait on it.
 task.spawn(function()
     while state.running do
-        if (state.autoFarm or state.killAura) and combatRemote and not resolving then
+        if (state.autoFarm or state.bossFarm or state.killAura) and combatRemote and not resolving then
             local ok, err = pcall(runCombatClick)
             if not ok then
                 releaseCombatActivation()
@@ -2721,7 +2877,7 @@ end)
 -- Auto Farm takes precedence if both toggles are enabled, avoiding duplicate bursts.
 task.spawn(function()
     while state.running do
-        if state.killAura and not state.autoFarm and combatRemote and not resolving then
+        if state.killAura and not state.autoFarm and not state.bossFarm and combatRemote and not resolving then
             local ok, err = pcall(function()
                 local mob, reason = findAuraSlime()
                 if mob then attack(mob, false) else setAuraStatus(reason) end
