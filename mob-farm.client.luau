@@ -2579,7 +2579,8 @@ installFarming()
 
 -- Try the original summon trigger first; no replacement summon remote is assumed.
 local function installBossFarm()
-    local boss = { autoSpawn=true, retry=15, nextSpawn=0, attempts=0, message="Off" }
+    local boss = { autoSpawn=true, retry=15, nextSpawn=0, attempts=0, message="Off",
+        afterKillWait=15, lastTarget=nil, returning=false, waitUntil=nil }
     local section=Main:AddSection("Slime King")
     local status=section:AddParagraph({Title="Boss Status",Content="Uses the original slime_king_spawn prompt. Select your weapon above; hide RoSnipe with Right Shift for automatic clicks."})
     local toggle
@@ -2607,8 +2608,20 @@ local function installBossFarm()
         local prompt=trigger and trigger:FindFirstChild("ProximityPrompt")
         return trigger,prompt,triggers
     end
+    local function updateReturnPosition()
+        local trigger,prompt=oldTrigger()
+        if trigger and trigger:IsA("BasePart") then
+            local height=3
+            if prompt and prompt:IsA("ProximityPrompt") and prompt.MaxActivationDistance>0 then
+                height=math.min(height,prompt.MaxActivationDistance/2)
+            end
+            state.bossReturnPosition=trigger.Position+Vector3.new(0,height,0)
+        end
+        return trigger,prompt
+    end
     stopBossFarm=function(reason)
-        state.bossFarm=false;state.bossDestination=nil
+        state.bossFarm=false;state.bossDestination=nil;state.bossReturnPosition=nil
+        boss.lastTarget=nil;boss.returning=false;boss.waitUntil=nil
         if toggle and toggle.Value then toggle:SetValue(false) end
         stopCombat()
         setBossStatus(reason or "Off")
@@ -2617,18 +2630,41 @@ local function installBossFarm()
         if not state.bossFarm then return end
         local character,humanoid,root=getCharacter()
         if not character then setBossStatus("Waiting for your character.");return end
+        local trigger,prompt=updateReturnPosition()
         local target,entities=findBoss()
-        state.target=target;state.bossDestination=nil
+        -- Keep a hover destination while the attack worker notices the death.
+        state.target=nil
+        state.bossDestination=state.bossReturnPosition or root.Position
+        if boss.lastTarget and target~=boss.lastTarget then
+            boss.lastTarget=nil;boss.returning=true;boss.waitUntil=nil
+        end
+        if boss.returning then
+            if not state.bossReturnPosition then
+                setBossStatus("Holding position: summon point unavailable. Save Boss Diagnostic.");return
+            end
+            if (root.Position-state.bossReturnPosition).Magnitude>2 then
+                -- The full rest period begins only after arriving back at the trigger.
+                boss.waitUntil=nil
+                setBossStatus("Returning to the Slime King spawn after the fight.");return
+            end
+            if not boss.waitUntil then boss.waitUntil=os.clock()+boss.afterKillWait end
+            local rest=boss.waitUntil-os.clock()
+            if rest>0 then
+                setBossStatus("Resting at Slime King spawn: "..math.ceil(rest).."s remaining.");return
+            end
+            boss.returning=false;boss.waitUntil=nil
+        end
         if not entities then setBossStatus("WildernessIsland.Entities is not loaded. Travel to the Slime King island.");return end
         if not combatRemote then setBossStatus("Combat lookup is unresolved. Check Combat Status and Refresh Combat Remotes.");return end
         if target then
+            boss.lastTarget=target
+            state.target=target;state.bossDestination=nil
             local health=target:FindFirstChildOfClass("Humanoid")
             setBossStatus("Fighting slimeKing | health "..tostring(health.Health))
             if (target.HumanoidRootPart.Position-root.Position).Magnitude<=math.max(20,math.abs(state.height)+5) then attack(target,true) end
             return
         end
         if not boss.autoSpawn then setBossStatus("Waiting for Slime King. Enable Boss Auto Spawn to summon it.");return end
-        local trigger,prompt=oldTrigger()
         assert(trigger and trigger:IsA("BasePart"),"Original slime_king_spawn part not found. Save Boss Diagnostic.")
         assert(prompt and prompt:IsA("ProximityPrompt"),"Original Slime King ProximityPrompt not found. Save Boss Diagnostic.")
         assert(type(fireproximityprompt)=="function","Executor has no fireproximityprompt. Save Boss Diagnostic.")
@@ -2636,7 +2672,7 @@ local function installBossFarm()
         local activationRange=math.max(0,prompt.MaxActivationDistance)
         if activationRange<=0 then setBossStatus("Summon prompt has no activation range. Save Boss Diagnostic.");return end
         -- Use the hub's existing movement mode to reach the original trigger.
-        state.bossDestination=trigger.Position
+        state.bossDestination=state.bossReturnPosition
         if (root.Position-trigger.Position).Magnitude>activationRange then
             setBossStatus("Moving to the original Slime King summon trigger.");return
         end
@@ -2662,13 +2698,18 @@ local function installBossFarm()
         if stopFarming then stopFarming() end
         if stopAutoBuild then stopAutoBuild("Stopped: boss farming enabled.") end
         state.bossFarm=true;boss.nextSpawn=0;boss.attempts=0
+        boss.lastTarget=nil;boss.returning=false;boss.waitUntil=nil
+        updateReturnPosition()
         stopCombat();setBossStatus("Starting Slime King farm with the original summon trigger.")
         if not combatRemote or combatWeapon~=selectedCombatTool() then task.spawn(refreshCombat) end
     end)
     section:AddToggle("BossAutoSpawn",{Title="Boss Auto Spawn",Default=true}):OnChanged(function(value)
         boss.autoSpawn=value
-        if not value then state.bossDestination=nil end
     end)
+    section:AddSlider("BossAfterKillWait",{Title="Wait at Spawn After Kill (seconds)",Default=15,Min=0,Max=300,Rounding=0,Callback=function(value)
+        boss.afterKillWait=value
+        if boss.waitUntil then boss.waitUntil=os.clock()+value end
+    end})
     section:AddSlider("BossSpawnRetry",{Title="Summon Retry Interval (seconds)",Default=15,Min=5,Max=120,Rounding=0,Callback=function(value) boss.retry=value end})
     section:AddButton({Title="Stop Boss Farm",Callback=function() stopBossFarm() end})
     section:AddButton({Title="Save Boss Diagnostic",Callback=function()
@@ -2679,6 +2720,8 @@ local function installBossFarm()
             local lines={"RoSnipe boss diagnostic (original trigger)","PlaceId="..game.PlaceId.." PlaceVersion="..game.PlaceVersion,
                 "Status="..boss.message,"BossAutoFarm="..tostring(state.bossFarm).." AutoSpawn="..tostring(boss.autoSpawn),
                 "Summon attempts="..boss.attempts.." fireproximityprompt="..type(fireproximityprompt),
+                "After-kill wait="..boss.afterKillWait.." Returning="..tostring(boss.returning).." WaitUntil="..tostring(boss.waitUntil),
+                "Return position="..tostring(state.bossReturnPosition),
                 "Selected weapon="..tostring(state.weapon).." Combat resolved="..tostring(combatRemote~=nil),
                 "Player position="..tostring(root and root.Position),"Living slimeKing="..tostring(target~=nil),
                 "Entities loaded="..tostring(entities~=nil),"Trigger="..(trigger and trigger:GetFullName() or "missing")}
@@ -2790,7 +2833,12 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
             destination = targetRoot.Position + Vector3.new(0, state.height, 0)
         end
     end
-    if resolving or not root or not destination then
+    -- A boss can die during attack()'s wait. Keep hovering and return immediately,
+    -- rather than dropping the player until the next combat-worker iteration.
+    if state.bossFarm and root and not destination then
+        destination=state.bossReturnPosition or root.Position
+    end
+    if (resolving and not state.bossFarm) or not root or not destination then
         restoreMovement()
         return
     end
