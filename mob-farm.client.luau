@@ -1146,7 +1146,7 @@ Settings:AddButton({
 
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
-    local build = { speed = 5, teleport = true, moveNear = false, useRadius = false, radius = 85,
+    local build = { speed = 5, teleport = true, moveNear = false, autoReach = true, useRadius = false, radius = 85,
         retryPasses = 4, showHUD = true, noclip = true, paused = false, saveName = "mybuild", collision = false, records = {},
         version = 0, busy = false, mode = nil, file = "Template", folder = "RoSnipe/Schematica", loadNearPlayer = true, events = {}, actions = {} }
     local function trace(kind, message)
@@ -1216,7 +1216,7 @@ local function installAutoBuild()
             pendingRequest=pendingRequest and not pendingRequest.done or false,
             placeRemote=placeRemote and placeRemote:GetFullName() or "unresolved", hashResolved=placeKey~=nil and placeHash~=nil,
             handleMode=build.handleMode or "none", handlesVisible=handles.Visible, handlesAdornee=handles.Adornee and handles.Adornee:GetFullName() or "none",
-            minimized=Window.Minimized, speed=build.speed, teleport=build.teleport, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
+            minimized=Window.Minimized, speed=build.speed, teleport=build.teleport, autoReach=build.autoReach, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
             actions=actions, events=events,
         }
     end
@@ -1777,7 +1777,7 @@ local function installAutoBuild()
         build.lastBuild=nil
         status("Last build data cleared. Your files and placed blocks are unchanged.")
     end
-    local function invoke(remote, payload, current, waitReady)
+    local function invoke(remote, payload, current, waitReady, beforeSend)
         assert(not pendingRequest or pendingRequest.done, "Previous build request is still waiting for the server.")
         if not waitReady() then return false end
         local request = {done=false}
@@ -1785,7 +1785,12 @@ local function installAutoBuild()
         task.spawn(function()
             -- A pause/stop may happen before this scheduled call actually starts.
             if not waitReady() then request.cancelled=true;request.done=true;return end
-            request.ok, request.result = pcall(function() return remote:InvokeServer(payload) end)
+            request.ok, request.result = pcall(function()
+                -- Recheck reach after a pause, immediately before the actual call.
+                if beforeSend and not beforeSend() then request.cancelled=true;return end
+                if not waitReady() then request.cancelled=true;return end
+                return remote:InvokeServer(payload)
+            end)
             request.done = true
         end)
         local deadline = os.clock()+8
@@ -1838,6 +1843,10 @@ local function installAutoBuild()
         local token = build.version
         local original = root.CFrame
         local frozen, movementConnection
+        local holdPosition, moved = root.Position, false
+        local function canMove()
+            return build.teleport or build.moveNear or (kind=="place" and build.autoReach)
+        end
         local savedCollisions={}
         local function releaseMovement()
             if movementConnection then movementConnection:Disconnect();movementConnection=nil end
@@ -1874,12 +1883,47 @@ local function installAutoBuild()
                 for part,value in pairs(savedCollisions) do if part.Parent then part.CanCollide=value end end
                 savedCollisions={}
             end
-            if build.teleport or build.moveNear then
+            if canMove() then
                 if not frozen then
-                    frozen=Instance.new("BodyVelocity")
-                    frozen.Name="RoSnipeBuildHover";frozen.MaxForce=Vector3.new(1e9,1e9,1e9);frozen.Velocity=Vector3.zero;frozen.Parent=root
+                    holdPosition=root.Position
+                    frozen=Instance.new("BodyPosition")
+                    frozen.Name="RoSnipeBuildHover"
+                    frozen.MaxForce=Vector3.new(1e9,1e9,1e9)
+                    frozen.P, frozen.D = 10000, 1000
+                    frozen.Position=holdPosition
+                    frozen.Parent=root
                 end
+                frozen.Position=holdPosition
             elseif frozen then frozen:Destroy();frozen=nil end
+        end
+        local function ensureReach(record)
+            -- A velocity-only hover can drift away from an elevated target.
+            -- Hold a position and verify again after replication/physics settles.
+            for attempt=1,3 do
+                if not waitReady() then return false end
+                local distance=(root.Position-record.cf.Position).Magnitude
+                if distance<=30 and not (canMove() and (build.moveNear or distance>24)) then
+                    if canMove() then
+                        syncMovement()
+                        holdPosition=root.Position
+                        if frozen then frozen.Position=holdPosition end
+                    end
+                    return true
+                end
+                assert(canMove(),"Target out of reach ("..math.floor(distance).." studs). Enable Auto Reach Floating Blocks or Move To Build Position.")
+                syncMovement()
+                holdPosition=record.cf.Position+Vector3.new(0,10,0)
+                if frozen then frozen.Position=holdPosition end
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.CFrame=CFrame.new(holdPosition)
+                moved=true
+                trace("build movement","Approach "..record.name.."; attempt "..attempt.."; distance "..math.floor(distance))
+                task.wait(0.2)
+                if not waitReady() then return false end
+                if (root.Position-record.cf.Position).Magnitude<=30 then return true end
+            end
+            error("Could not stay within placement reach of "..record.name.." ("..math.floor((root.Position-record.cf.Position).Magnitude)
+                .." studs). The character may be getting moved back; no request was sent for this block.",0)
         end
         local function arrange(queue)
             local center=root.Position
@@ -1929,14 +1973,9 @@ local function installAutoBuild()
                             report.phase,report.currentName=pass==1 and "Placing" or ("Retry "..(pass-1)),record.name
                             renderBOM()
                         end
-                        if build.moveNear or (build.teleport and (root.Position-record.cf.Position).Magnitude>24) then
-                            root.CFrame=CFrame.new(record.cf.Position+Vector3.new(0,10,0))
-                            task.wait(0.15)
-                        end
-                        if not waitReady() then break end
-                        assert((root.Position-record.cf.Position).Magnitude<=30,"Target out of reach. Enable Move To Build Position or Move Near Block Before Placing.")
                         if kind=="place" then
-                            local sent,accepted=invoke(placeRemote,{[placeKey]=placeHash,cframe=record.cf,blockType=record.name,upperBlock=record.upperBlock==true},current,waitReady)
+                            local sent,accepted=invoke(placeRemote,{[placeKey]=placeHash,cframe=record.cf,blockType=record.name,upperBlock=record.upperBlock==true},current,waitReady,
+                                function() return ensureReach(record) end)
                             if not sent then break end
                             requests=requests+1;report.sent=requests
                             if not accepted then trace("placement rejected",record.name.."; will recheck on the next pass") end
@@ -1948,7 +1987,8 @@ local function installAutoBuild()
                                 if not waitReady() or not record.block.Parent then break end
                                 assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
                                 local sent,accepted=invoke(treeRemote,{[treeHashKey]=treeHashValue,part=record.part,block=record.block,
-                                    norm=record.part.CFrame.UpVector,pos=record.part.Position},current,waitReady)
+                                    norm=record.part.CFrame.UpVector,pos=record.part.Position},current,waitReady,
+                                    function() return ensureReach(record) end)
                                 if not sent then break end
                                 assert(accepted,"Server rejected the block hit.")
                                 requests=requests+1
@@ -1985,7 +2025,7 @@ local function installAutoBuild()
             end,traceback)
             releaseMovement()
             if build.releaseMovement==releaseMovement then build.releaseMovement=nil end
-            if current() and (build.teleport or build.moveNear) then root.CFrame=original end
+            if current() and moved then root.CFrame=original end
             build.busy,build.paused=false,false
             if report and state.running then
                 if not ok then report.phase="Error";report.currentName=nil
@@ -2096,6 +2136,7 @@ local function installAutoBuild()
         return item
     end
     toggle(settings,"BuildMoveNear","Move Near Block Before Placing","Move beside each block before its placement request.",false,function(v) build.moveNear=v end)
+    toggle(settings,"BuildAutoReach","Auto Reach Floating Blocks","Automatically move within reach and hover for elevated placements, even with Move To Build Position off.",true,function(v) build.autoReach=v end)
     local controls=AutoBuild:AddSection("AUTOBUILD")
     toggle(controls,"BuildTeleport","Move To Build Position","Moves within reach as the build progresses.",true,function(v) build.teleport=v end)
     toggle(controls,"BuildUseRadius","Use Build Radius","Prioritizes blocks inside your radius first; remaining blocks follow.",false,function(v) build.useRadius=v end)
