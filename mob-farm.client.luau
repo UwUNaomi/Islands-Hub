@@ -1146,25 +1146,25 @@ Settings:AddButton({
     Callback = function() task.spawn(refreshCombat) end,
 })
 
--- Reuses the original script's ordinary CLIENT_CHEST_TRANSACTION withdraw
--- request, restricted to large industrial chests in the local player's island.
+-- Follows the original ChestAura loop: send one ordinary withdraw request for
+-- each child in Contents. It deliberately does not toggle the chest UI open.
 local function installChestPickup()
     local section=Auto:AddSection("CHEST PICKUP")
     local status=Auto:AddParagraph({Title="Chest Pickup Status",Content="Off. Scans only chestLargeIndustrialIO on your own island."})
     local running,generation=false,0
-    local delaySeconds=0.1
+    local delaySeconds=0
     local travelSpeed=35
     local nearbyOnly=true
     local nearbyRange=12
     local activeTween
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
-        Description="Withdraws each stored stack in sequence, confirming one before sending the next.",
+        Description="Uses the original ChestAura pattern: request each stored stack in one pass.",
         Default=false,
     })
     section:AddSlider("ChestPickupDelay",{
-        Title="Delay Between Items (seconds)",Description="Extra pause after each confirmed stack; the next request waits for replication first.",
-        Default=0.1,Min=0.05,Max=1,Rounding=2,Callback=function(value) delaySeconds=value end,
+        Title="Delay Between Requests (seconds)",Description="Optional pause between the original per-stack withdraw requests.",
+        Default=0,Min=0,Max=1,Rounding=2,Callback=function(value) delaySeconds=value end,
     })
     section:AddSlider("ChestPickupTravelSpeed",{
         Title="Chest Travel Speed",Description="Tween speed in studs per second.",
@@ -1229,15 +1229,6 @@ local function installChestPickup()
         assert(remote and remote:IsA("RemoteFunction"),"CLIENT_CHEST_TRANSACTION was not found; save a chest interaction diagnostic.")
         return remote
     end
-    local function chestToggleRemote()
-        local net=ReplicatedStorage
-        for _,name in ipairs({"rbxts_include","node_modules","@rbxts","net","out","_NetManaged"}) do
-            net=net and net:FindFirstChild(name)
-        end
-        local remote=net and net:FindFirstChild("CHEST_TOGGLE")
-        assert(remote and remote:IsA("RemoteFunction"),"CHEST_TOGGLE RemoteFunction was not found.")
-        return remote
-    end
     local function amountOf(item)
         local amount=item:FindFirstChild("Amount")
         local value=amount and tonumber(amount.Value)
@@ -1270,7 +1261,6 @@ local function installChestPickup()
         task.spawn(function()
             local ok,err=xpcall(function()
                 local remote=chestRemote()
-                local toggleRemote=chestToggleRemote()
                 local lastRequested=setmetatable({}, {__mode="k"})
                 local total,chests,lastResult=0,0,nil
                 status:SetDesc("Scanning your island for large industrial chests...")
@@ -1296,70 +1286,63 @@ local function installChestPickup()
                         local chest=entry.block
                         if not nearbyOnly and not moveToChest(chest,chestIndex,found,token) then break end
                         local contents=chest:FindFirstChild("Contents")
-                        local didOpen=false
-                        local opened,openError=pcall(function()
-                            status:SetDesc("Opening chest "..chestIndex.." / "..found.."...")
-                            toggleRemote:InvokeServer({chest=chest,open=true})
-                            didOpen=true
-                            task.wait(0.15)
-                            local confirmed,unchanged=0,0
-                            if contents then
-                                for _,item in ipairs(contents:GetChildren()) do
-                                    if not running or generation~=token then break end
-                                    local amount=amountOf(item)
-                                    if item.Parent==contents and lastRequested[item]~=amount then
-                                        local inventoryBefore=inventoryAmount(item.Name)
-                                        local response=remote:InvokeServer({
-                                            chest=chest,
-                                            player_tracking_category="join_from_web",
-                                            amount=amount,
-                                            tool=item,
-                                            action="withdraw",
-                                        })
-                                        if response==false or (type(response)=="table" and response.success==false) then
-                                            error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
-                                        end
-                                        status:SetDesc("Withdrawing "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
-                                        local changed=false
-                                        -- Wait for this exact stack to move or the inventory to
-                                        -- update before sending the next request. The remote returns
-                                        -- nil even on normal interactions, so its reply is not proof
-                                        -- that the server accepted the withdrawal.
-                                        for _=1,30 do
-                                            if not running or generation~=token then break end
-                                            local currentAmount=item:FindFirstChild("Amount")
-                                            if item.Parent~=contents or not item.Parent
-                                                or (currentAmount and (tonumber(currentAmount.Value) or amount)<amount)
-                                                or inventoryAmount(item.Name)>inventoryBefore then
-                                                changed=true
-                                                break
-                                            end
-                                            task.wait(0.1)
-                                        end
-                                        task.wait(delaySeconds)
-                                        lastRequested[item]=amount
-                                        if changed then
-                                            total=total+1
-                                            confirmed=confirmed+1
-                                            lastResult="Confirmed "..item.Name.." × "..amount
-                                        else
-                                            unchanged=unchanged+1
-                                            lastResult="No visible change for "..item.Name.." × "..amount
-                                            status:SetDesc("Stopped after "..confirmed.." confirmed stack(s): "..lastResult..". Check inventory space, chest permissions, or server cooldown.")
-                                            break
-                                        end
-                                        status:SetDesc("Chest "..chestIndex.." / "..found..": "..confirmed.." stack(s) confirmed; latest "..lastResult)
+                        local pending={}
+                        local inventoryBeforeByName={}
+                        if contents then
+                            for _,item in ipairs(contents:GetChildren()) do
+                                if not running or generation~=token then break end
+                                local amount=amountOf(item)
+                                if item.Parent==contents and lastRequested[item]~=amount then
+                                    if inventoryBeforeByName[item.Name]==nil then
+                                        inventoryBeforeByName[item.Name]=inventoryAmount(item.Name)
                                     end
+                                    local response=remote:InvokeServer({
+                                        chest=chest,
+                                        player_tracking_category="join_from_web",
+                                        amount=amount,
+                                        tool=item,
+                                        action="withdraw",
+                                    })
+                                    if response==false or (type(response)=="table" and response.success==false) then
+                                        error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
+                                    end
+                                    lastRequested[item]=amount
+                                    table.insert(pending,{item=item,name=item.Name,amount=amount})
+                                    status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
+                                    if delaySeconds>0 then task.wait(delaySeconds) end
                                 end
                             end
-                            if unchanged>0 then lastResult=lastResult.." ("..unchanged.." unchanged)" end
-                        end)
-                        local closed,closeError=true,nil
-                        if didOpen then
-                            closed,closeError=pcall(function() toggleRemote:InvokeServer({chest=chest,open=false}) end)
                         end
-                        if not opened then error(openError,0) end
-                        if not closed then error("Could not close chest after pickup: "..tostring(closeError),0) end
+                        -- The OG sends every stack request in one pass. Check the resulting state
+                        -- after the pass; the RemoteFunction's nil return is not a success signal.
+                        if #pending>0 then task.wait(0.5) end
+                        local confirmed,unchanged=0,0
+                        local inventoryCredit={}
+                        for name,before in pairs(inventoryBeforeByName) do
+                            inventoryCredit[name]=math.max(0,inventoryAmount(name)-before)
+                        end
+                        for _,request in ipairs(pending) do
+                            local amountValue=request.item:FindFirstChild("Amount")
+                            local changed=request.item.Parent~=contents or not request.item.Parent
+                                or (amountValue and (tonumber(amountValue.Value) or request.amount)<request.amount)
+                            if changed then
+                                inventoryCredit[request.name]=math.max(0,(inventoryCredit[request.name] or 0)-request.amount)
+                            elseif (inventoryCredit[request.name] or 0)>=request.amount then
+                                changed=true
+                                inventoryCredit[request.name]=inventoryCredit[request.name]-request.amount
+                            end
+                            if changed then
+                                total=total+1
+                                confirmed=confirmed+1
+                                lastResult="Confirmed "..request.name.." × "..request.amount
+                            else
+                                unchanged=unchanged+1
+                                lastResult="No visible change for "..request.name.." × "..request.amount
+                            end
+                        end
+                        if #pending>0 then
+                            status:SetDesc("Chest "..chestIndex.." / "..found..": sent "..#pending.." request(s), "..confirmed.." confirmed, "..unchanged.." unchanged.")
+                        end
                     end
                     if not running or generation~=token then break end
                     if found==0 then
