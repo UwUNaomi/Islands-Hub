@@ -1159,11 +1159,11 @@ local function installChestPickup()
     local activeTween
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
-        Description="Withdraws stored items from chestLargeIndustrialIO chests on your own island.",
+        Description="Withdraws each stored stack in sequence, confirming one before sending the next.",
         Default=false,
     })
     section:AddSlider("ChestPickupDelay",{
-        Title="Delay Between Items (seconds)",Description="Short pauses between normal withdraw requests.",
+        Title="Delay Between Items (seconds)",Description="Extra pause after each confirmed stack; the next request waits for replication first.",
         Default=0.1,Min=0.05,Max=1,Rounding=2,Callback=function(value) delaySeconds=value end,
     })
     section:AddSlider("ChestPickupTravelSpeed",{
@@ -1302,12 +1302,12 @@ local function installChestPickup()
                             toggleRemote:InvokeServer({chest=chest,open=true})
                             didOpen=true
                             task.wait(0.15)
-                            local pending={}
+                            local confirmed,unchanged=0,0
                             if contents then
                                 for _,item in ipairs(contents:GetChildren()) do
                                     if not running or generation~=token then break end
                                     local amount=amountOf(item)
-                                    if lastRequested[item]~=amount then
+                                    if item.Parent==contents and lastRequested[item]~=amount then
                                         local inventoryBefore=inventoryAmount(item.Name)
                                         local response=remote:InvokeServer({
                                             chest=chest,
@@ -1319,35 +1319,40 @@ local function installChestPickup()
                                         if response==false or (type(response)=="table" and response.success==false) then
                                             error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
                                         end
-                                        lastRequested[item]=amount
-                                        table.insert(pending,{item=item,name=item.Name,amount=amount,inventoryBefore=inventoryBefore})
-                                        status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
+                                        status:SetDesc("Withdrawing "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
+                                        local changed=false
+                                        -- Wait for this exact stack to move or the inventory to
+                                        -- update before sending the next request. The remote returns
+                                        -- nil even on normal interactions, so its reply is not proof
+                                        -- that the server accepted the withdrawal.
+                                        for _=1,30 do
+                                            if not running or generation~=token then break end
+                                            local currentAmount=item:FindFirstChild("Amount")
+                                            if item.Parent~=contents or not item.Parent
+                                                or (currentAmount and (tonumber(currentAmount.Value) or amount)<amount)
+                                                or inventoryAmount(item.Name)>inventoryBefore then
+                                                changed=true
+                                                break
+                                            end
+                                            task.wait(0.1)
+                                        end
                                         task.wait(delaySeconds)
+                                        lastRequested[item]=amount
+                                        if changed then
+                                            total=total+1
+                                            confirmed=confirmed+1
+                                            lastResult="Confirmed "..item.Name.." × "..amount
+                                        else
+                                            unchanged=unchanged+1
+                                            lastResult="No visible change for "..item.Name.." × "..amount
+                                            status:SetDesc("Stopped after "..confirmed.." confirmed stack(s): "..lastResult..". Check inventory space, chest permissions, or server cooldown.")
+                                            break
+                                        end
+                                        status:SetDesc("Chest "..chestIndex.." / "..found..": "..confirmed.." stack(s) confirmed; latest "..lastResult)
                                     end
                                 end
                             end
-                            -- Let the server replicate all stack results once per chest instead of
-                            -- waiting up to two seconds after every individual item request.
-                            if #pending>0 then task.wait(0.5) end
-                            local confirmed,unchanged=0,0
-                            for _,request in ipairs(pending) do
-                                local remaining=contents and contents:FindFirstChild(request.name)
-                                local changed=request.item.Parent~=contents or not request.item.Parent
-                                    or (remaining and remaining:FindFirstChild("Amount")
-                                        and (tonumber(remaining.Amount.Value) or request.amount)<request.amount)
-                                    or inventoryAmount(request.name)>request.inventoryBefore
-                                if changed then
-                                    total=total+1
-                                    confirmed=confirmed+1
-                                    lastResult="Confirmed "..request.name.." × "..request.amount
-                                else
-                                    unchanged=unchanged+1
-                                    lastResult="No visible change for "..request.name.." × "..request.amount
-                                end
-                            end
-                            if #pending>0 then
-                                status:SetDesc("Chest "..chestIndex.." / "..found..": "..confirmed.." confirmed, "..unchanged.." unchanged; "..total.." stack(s) confirmed total.")
-                            end
+                            if unchanged>0 then lastResult=lastResult.." ("..unchanged.." unchanged)" end
                         end)
                         local closed,closeError=true,nil
                         if didOpen then
