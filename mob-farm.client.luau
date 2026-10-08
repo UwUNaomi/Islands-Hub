@@ -1298,7 +1298,7 @@ local function installChestPickup()
             local ok,err=xpcall(function()
                 local remote=chestRemote()
                 local lastRequested=setmetatable({}, {__mode="k"})
-                local total,chests,lastResult=0,0,nil
+                local total,rejected,chests,lastResult=0,0,0,nil
                 status:SetDesc("Scanning your island for large industrial chests...")
                 while running and generation==token do
                     local blocks=ownBlockFolder()
@@ -1324,6 +1324,7 @@ local function installChestPickup()
                         local contents=chest:FindFirstChild("Contents")
                         local pending={}
                         local inventoryBeforeByName={}
+                        local rejectedThisChest=0
                         if contents then
                             for _,item in ipairs(contents:GetChildren()) do
                                 if not running or generation~=token then break end
@@ -1332,19 +1333,27 @@ local function installChestPickup()
                                     if inventoryBeforeByName[item.Name]==nil then
                                         inventoryBeforeByName[item.Name]=inventoryAmount(item.Name)
                                     end
-                                    local response=remote:InvokeServer({
-                                        chest=chest,
-                                        player_tracking_category="join_from_web",
-                                        amount=amount,
-                                        tool=item,
-                                        action="withdraw",
-                                    })
-                                    if response==false or (type(response)=="table" and response.success==false) then
-                                        error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
+                                    local invoked,response=pcall(function()
+                                        return remote:InvokeServer({
+                                            chest=chest,
+                                            player_tracking_category="join_from_web",
+                                            amount=amount,
+                                            tool=item,
+                                            action="withdraw",
+                                        })
+                                    end)
+                                    local wasRejected=not invoked or response==false
+                                        or (type(response)=="table" and response.success==false)
+                                    if wasRejected then
+                                        rejected=rejected+1
+                                        rejectedThisChest=rejectedThisChest+1
+                                        lastResult="Server rejected "..item.Name.." × "..amount.."; will retry"
+                                        status:SetDesc(lastResult.." and continue to the next stack.")
+                                    else
+                                        lastRequested[item]=amount
+                                        table.insert(pending,{item=item,name=item.Name,amount=amount})
+                                        status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
                                     end
-                                    lastRequested[item]=amount
-                                    table.insert(pending,{item=item,name=item.Name,amount=amount})
-                                    status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
                                     local pause=tonumber(delaySeconds) or 0
                                     if pause>0 then task.wait(pause) end
                                 end
@@ -1374,11 +1383,14 @@ local function installChestPickup()
                                 lastResult="Confirmed "..request.name.." × "..request.amount
                             else
                                 unchanged=unchanged+1
-                                lastResult="No visible change for "..request.name.." × "..request.amount
+                                rejected=rejected+1
+                                rejectedThisChest=rejectedThisChest+1
+                                lastRequested[request.item]=nil
+                                lastResult="No visible change for "..request.name.." × "..request.amount.."; will retry"
                             end
                         end
-                        if #pending>0 then
-                            status:SetDesc("Chest "..chestIndex.." / "..found..": sent "..#pending.." request(s), "..confirmed.." confirmed, "..unchanged.." unchanged.")
+                        if #pending>0 or rejectedThisChest>0 then
+                            status:SetDesc("Chest "..chestIndex.." / "..found..": sent "..#pending.." request(s), "..confirmed.." confirmed, "..unchanged.." unchanged; "..rejectedThisChest.." rejected/queued to retry.")
                         end
                     end
                     if not running or generation~=token then break end
@@ -1388,7 +1400,7 @@ local function installChestPickup()
                             or "No chestLargeIndustrialIO chests found on your island.")
                     else
                         status:SetDesc((nearbyOnly and ("Swept "..found.." nearby chest(es); ") or ("Watching "..found.." large industrial chest(es); "))
-                            ..total.." confirmed stack(s). "..tostring(lastResult or "Turn off to stop."))
+                            ..total.." confirmed stack(s), "..rejected.." rejected/retrying. "..tostring(lastResult or "Turn off to stop."))
                     end
                     task.wait(1)
                 end
