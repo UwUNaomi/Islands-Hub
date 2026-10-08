@@ -67,6 +67,8 @@ local state = {
     treeRange = 12,
     treeInterval = 0.5,
     treeTarget = nil,
+    totemUpgrade = false,
+    totemDestination = nil,
 }
 local connections = {}
 local combatRemote, combatKey, combatHash, combatWeapon
@@ -82,6 +84,7 @@ local stopAutoBuild
 local stopChestPickup
 local stopFarming, resolveCropPlacement
 local stopBossFarm, runBossOnce, setBossStatus
+local stopTotemUpgrade
 local generation = 0
 local combatRequests = 0
 local activeCombatActivation
@@ -811,6 +814,7 @@ MobSection:AddSlider("MobHeight", {
 farmToggle = MobSection:AddToggle("MobAutoFarmToggle", { Title = "Mob Auto Farm", Default = false })
 farmToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: combat enabled.") end
     if value and stopBossFarm then stopBossFarm() end
     if value and stopCutting then stopCutting() end
     if value and stopFarming then stopFarming() end
@@ -821,6 +825,7 @@ end)
 auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Auto Click + Remote)", Default = false })
 auraToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: combat enabled.") end
     if value and stopBossFarm then stopBossFarm() end
     if value and stopCutting then stopCutting() end
     if value and stopFarming then stopFarming() end
@@ -1100,6 +1105,7 @@ stopCutting = function()
     setTreeStatus("Off")
 end
 local function setCuttingMode(mode, value)
+    if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: cutting enabled.") end
     if value and stopBossFarm then stopBossFarm() end
     if value and stopFarming then stopFarming() end
     if value and stopAutoBuild then stopAutoBuild("Stopped: cutting enabled.") end
@@ -1320,6 +1326,7 @@ local function installChestPickup()
         return total
     end
     toggle:OnChanged(function(enabled)
+        if enabled and stopTotemUpgrade then stopTotemUpgrade("Stopped: chest pickup enabled.") end
         generation=generation+1
         local token=generation
         running=enabled
@@ -1467,9 +1474,247 @@ local function installChestPickup()
         running=false
         setChestNoclip(false)
         if releaseHover then releaseChestHover() end
+        if toggle.Value then toggle:SetValue(false) end
     end
 end
 installChestPickup()
+
+-- Totem upgrades combine the broad crop/rock mapping from Ashlux's module
+-- with progress-confirmed requests from newer public Islands scripts.
+local function installTotemUpgrade()
+    local section = Auto:AddSection("TOTEM UPGRADER")
+    local status = Auto:AddParagraph({
+        Title = "Totem Upgrade Status",
+        Content = "Off. Select a totem, stat, and target level.",
+    })
+    local cropTotems = {
+        "totemPineapple", "totemStarfruit", "totemGrape", "totemOnion", "totemMelon",
+        "totemRedBerryBush", "totemBlackberryBush", "totemBlueberryBush", "totemCarrot",
+        "totemTomato", "totemWheat", "totemDragonfruit", "totemSpinach", "totemRadish",
+        "totemPumpkin", "totemPotato",
+    }
+    local rockTotems = {
+        "totemTest", "totemObsidian", "totemGranite", "totemClay", "totemStone",
+        "totemSlate", "totemAquamarine", "totemMarble", "totemSandstoneRed",
+        "totemIron", "totemDiorite", "totemAndesite", "totemSandstone", "totemCoal",
+    }
+    local totemNames = { "All Totems" }
+    local cropSet = {}
+    local knownTotems = {}
+    for _, name in ipairs(cropTotems) do cropSet[name] = true; knownTotems[name] = true; table.insert(totemNames, name) end
+    for _, name in ipairs(rockTotems) do knownTotems[name] = true; table.insert(totemNames, name) end
+    table.sort(totemNames, function(a, b)
+        if a == "All Totems" or b == "All Totems" then return a == "All Totems" and b ~= "All Totems" end
+        return a < b
+    end)
+
+    local selectedTotem, selectedStat, targetLevel = "totemWheat", "All Stats", 25
+    local running, generation = false, 0
+    local changingToggle = false
+    local totemDropdown = section:AddDropdown("TotemUpgradeTarget", {
+        Title = "Totem", Values = totemNames, Default = selectedTotem, Multi = false,
+    })
+    totemDropdown:OnChanged(function(value) selectedTotem = value end)
+    local statDropdown = section:AddDropdown("TotemUpgradeStat", {
+        Title = "Upgrade", Values = { "All Stats", "utility", "efficiency", "quality" },
+        Default = selectedStat, Multi = false,
+    })
+    statDropdown:OnChanged(function(value) selectedStat = value end)
+    section:AddSlider("TotemUpgradeLevel", {
+        Title = "Target Level", Default = targetLevel, Min = 1, Max = 53, Rounding = 0,
+        Callback = function(value) targetLevel = math.floor(tonumber(value) or 25) end,
+    })
+    local toggle = section:AddToggle("AutoUpgradeTotems", {
+        Title = "Auto Upgrade Totems", Description = "Waits for each UpgradeProgress value to change before continuing.",
+        Default = false,
+    })
+
+    local function setStatus(message)
+        if state.running then status:SetDesc(message) end
+    end
+    local function ownBlocks()
+        local islands = workspace:FindFirstChild("Islands")
+        for _, island in ipairs(islands and islands:GetChildren() or {}) do
+            local owners = island:FindFirstChild("Owners")
+            local blocks = island:FindFirstChild("Blocks")
+            if owners and blocks and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then
+                return blocks
+            end
+        end
+    end
+    local function totemCategory(totemName)
+        return cropSet[totemName] and "totem_crop" or "totem_rock"
+    end
+    local function progressValue(totem, stat)
+        local progress = totem:FindFirstChild("UpgradeProgress")
+        local value = progress and progress:FindFirstChild(stat)
+        assert(value and value:IsA("ValueBase"), "Missing UpgradeProgress." .. stat .. " on " .. totem.Name)
+        return value
+    end
+    local function getUpgradeRemote()
+        local node = ReplicatedStorage
+        for _, name in ipairs({ "rbxts_include", "node_modules", "@rbxts", "net", "out", "_NetManaged" }) do
+            node = node and node:FindFirstChild(name)
+        end
+        local remote = node and node:FindFirstChild("UpgradeBlock")
+        assert(remote and remote:IsA("RemoteFunction"), "UpgradeBlock remote not found.")
+        return remote
+    end
+    local function findTotems(blocks)
+        local found = {}
+        for _, block in ipairs(blocks:GetChildren()) do
+            if knownTotems[block.Name] and block:FindFirstChild("UpgradeProgress")
+                and (selectedTotem == "All Totems" or block.Name == selectedTotem) then
+                local part = block:IsA("BasePart") and block or block:FindFirstChildWhichIsA("BasePart", true)
+                if part then table.insert(found, { block = block, part = part }) end
+            end
+        end
+        local _, _, root = getCharacter()
+        if root then
+            table.sort(found, function(a, b)
+                return (root.Position - a.part.Position).Magnitude < (root.Position - b.part.Position).Magnitude
+            end)
+        end
+        return found
+    end
+    local function current(token)
+        return state.running and running and generation == token
+    end
+    local function upgradeStat(remote, entry, stat, token)
+        local block = entry.block
+        local progress = progressValue(block, stat)
+        while current(token) and block.Parent and progress.Value < targetLevel do
+            local _, _, root = getCharacter()
+            if not root then setStatus("Waiting for your character to spawn..."); task.wait(0.5); continue end
+            if (root.Position - entry.part.Position).Magnitude > 10 then
+                state.totemDestination = entry.part.Position + Vector3.new(0, 5, 0)
+                setStatus("Moving beside " .. block.Name .. " to upgrade " .. stat .. "...")
+                local moveDeadline = os.clock() + 20
+                repeat
+                    if not current(token) then return end
+                    task.wait(0.1)
+                    _, _, root = getCharacter()
+                until root and (root.Position - entry.part.Position).Magnitude <= 10 or os.clock() >= moveDeadline
+                state.totemDestination = nil
+                assert(root and (root.Position - entry.part.Position).Magnitude <= 10,
+                    "Could not reach " .. block.Name .. " within 10 studs.")
+            end
+
+            local confirmed = false
+            for attempt = 1, 3 do
+                if not current(token) or not block.Parent or progress.Value >= targetLevel then
+                    confirmed = progress.Value >= targetLevel
+                    break
+                end
+                local before = progress.Value
+                local invoked, result = pcall(function()
+                    return remote:InvokeServer(block, totemCategory(block.Name), stat)
+                end)
+                local rejected = not invoked or result == false or (type(result) == "table" and result.success == false)
+                if not rejected then
+                    setStatus(block.Name .. " / " .. stat .. ": request " .. attempt .. "/3 sent; waiting for progress...")
+                    local deadline = os.clock() + 8
+                    while current(token) and block.Parent and progress.Value == before and os.clock() < deadline do
+                        task.wait(0.1)
+                    end
+                end
+                if progress.Value > before then
+                    confirmed = true
+                    break
+                end
+                if attempt < 3 then
+                    setStatus((rejected and "Request rejected" or "No progress yet") .. " for " .. block.Name
+                        .. " / " .. stat .. "; retry " .. (attempt + 1) .. "/3 in 0.5s.")
+                    task.wait(0.5)
+                end
+            end
+            if not current(token) then return end
+            assert(confirmed,
+                "No progress for " .. block.Name .. " / " .. stat .. " after 3 attempts. Check upgrade materials, totem range, and current game version.")
+            setStatus(block.Name .. " / " .. stat .. ": confirmed " .. progress.Value .. " / " .. targetLevel .. ".")
+        end
+    end
+
+    local function start()
+        generation = generation + 1
+        local token = generation
+        running = true
+        state.totemUpgrade = true
+        state.totemDestination = nil
+        -- Keep the shared movement controller from fighting another active farm.
+        if stopAutoBuild then stopAutoBuild("Stopped: totem upgrade enabled.") end
+        if stopChestPickup then stopChestPickup(false) end
+        if stopBossFarm then stopBossFarm() end
+        if stopCutting then stopCutting() end
+        if stopFarming then stopFarming() end
+        stopCombat()
+        task.spawn(function()
+            local ok, err = xpcall(function()
+                local remote = getUpgradeRemote()
+                local stats = selectedStat == "All Stats" and { "utility", "efficiency", "quality" } or { selectedStat }
+                while current(token) do
+                    local blocks = ownBlocks()
+                    assert(blocks, "Your island's Blocks folder was not found.")
+                    local totems = findTotems(blocks)
+                    if #totems == 0 then
+                        setStatus("No matching owned totems with UpgradeProgress found. Scanning again...")
+                    else
+                        local changed = false
+                        for _, entry in ipairs(totems) do
+                            if not current(token) then break end
+                            for _, stat in ipairs(stats) do
+                                local progress = progressValue(entry.block, stat)
+                                if progress.Value < targetLevel then
+                                    changed = true
+                                    upgradeStat(remote, entry, stat, token)
+                                end
+                            end
+                        end
+                        if not changed then
+                            setStatus("All selected totems have reached the requested level.")
+                            break
+                        end
+                    end
+                    task.wait(0.5)
+                end
+            end, debug.traceback)
+            local completedWhileActive = current(token)
+            state.totemDestination = nil
+            state.totemUpgrade = false
+            running = false
+            if completedWhileActive then
+                changingToggle = true
+                toggle:SetValue(false)
+                changingToggle = false
+            end
+            if not ok then
+                setStatus("Totem upgrade stopped: " .. tostring(err))
+            elseif completedWhileActive then
+                setStatus("All selected totems have reached the requested level.")
+            end
+        end)
+    end
+    stopTotemUpgrade = function(message)
+        generation = generation + 1
+        running = false
+        state.totemUpgrade = false
+        state.totemDestination = nil
+        if toggle.Value and not changingToggle then
+            changingToggle = true
+            toggle:SetValue(false)
+            changingToggle = false
+        end
+        if message then setStatus(message) end
+    end
+    toggle:OnChanged(function(enabled)
+        if enabled then
+            start()
+        elseif not changingToggle then
+            stopTotemUpgrade("Stopped.")
+        end
+    end)
+end
+installTotemUpgrade()
 
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
@@ -2052,6 +2297,7 @@ local function installAutoBuild()
     end
     stopAutoBuild = stop
     local function stopFarms()
+        if stopTotemUpgrade then stopTotemUpgrade("Stopped: auto build enabled.") end
         if stopBossFarm then stopBossFarm() end
         if stopFarming then stopFarming() end
         farmToggle:SetValue(false)
@@ -2860,6 +3106,7 @@ local function installFarming()
     local function setMode(mode, value)
         if changingMode then return end
         if not value then if farm.mode==mode then stopFarming() end;return end
+        if stopTotemUpgrade then stopTotemUpgrade("Stopped: crop farming enabled.") end
         stopFarming()
         if stopBossFarm then stopBossFarm() end
         farmToggle:SetValue(false); auraToggle:SetValue(false); stopCutting()
@@ -3195,6 +3442,7 @@ local function installBossFarm()
     toggle=section:AddToggle("BossAutoFarm",{Title="Boss Auto Farm (Slime King)",Default=false})
     toggle:OnChanged(function(value)
         if not value then if state.bossFarm then stopBossFarm() end;return end
+        if stopTotemUpgrade then stopTotemUpgrade("Stopped: boss farming enabled.") end
         farmToggle:SetValue(false);auraToggle:SetValue(false)
         if stopCutting then stopCutting() end
         if stopFarming then stopFarming() end
@@ -3265,6 +3513,7 @@ installBossFarm()
 local function shutdown()
     if not state.running then return end
     if stopChestPickup then stopChestPickup(true) end
+    if stopTotemUpgrade then stopTotemUpgrade() end
     if stopBossFarm then stopBossFarm() end
     if stopFarming then stopFarming() end
     state.running = false
@@ -3321,7 +3570,9 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
         restoreRageblade()
     end
     local destination
-    if state.cropDestination then
+    if state.totemUpgrade and state.totemDestination then
+        destination = state.totemDestination
+    elseif state.cropDestination then
         destination = state.cropDestination
     elseif state.treeFarm and validTreeTarget(state.treeTarget) then
         -- Cutting stands beside the trunk; the -10 offset belongs to Combat only.
