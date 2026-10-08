@@ -1154,6 +1154,8 @@ local function installChestPickup()
     local running,generation=false,0
     local delaySeconds=0.1
     local travelSpeed=35
+    local nearbyOnly=true
+    local nearbyRange=12
     local activeTween
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
@@ -1168,11 +1170,23 @@ local function installChestPickup()
         Title="Chest Travel Speed",Description="Tween speed in studs per second.",
         Default=35,Min=10,Max=100,Rounding=0,Callback=function(value) travelSpeed=value end,
     })
+    section:AddToggle("ChestPickupNearbyOnly",{
+        Title="Only Chests in Range",Description="Sweep nearby chests without moving; keep the range within normal chest reach.",
+        Default=true,Callback=function(value) nearbyOnly=value end,
+    })
+    section:AddSlider("ChestPickupRange",{
+        Title="Nearby Chest Range (studs)",Description="Maximum distance for the nearby-only sweep.",
+        Default=12,Min=4,Max=14,Rounding=0,Callback=function(value) nearbyRange=value end,
+    })
+    local function chestPart(chest)
+        local part=chest:IsA("BasePart") and chest or chest:FindFirstChild("Root",true)
+        if not part or not part:IsA("BasePart") then part=chest:FindFirstChildWhichIsA("BasePart",true) end
+        return part
+    end
     local function moveToChest(chest,number,total,token)
         local character,humanoid,root=getCharacter()
         assert(character,"Wait for your character before starting chest pickup.")
-        local part=chest:IsA("BasePart") and chest or chest:FindFirstChild("Root",true)
-        if not part or not part:IsA("BasePart") then part=chest:FindFirstChildWhichIsA("BasePart",true) end
+        local part=chestPart(chest)
         assert(part,"Chest has no usable part: "..chest.Name)
         local horizontal=Vector3.new(root.Position.X-part.Position.X,0,root.Position.Z-part.Position.Z)
         if horizontal.Magnitude<0.1 then
@@ -1264,15 +1278,23 @@ local function installChestPickup()
                     local blocks=ownBlockFolder()
                     assert(blocks,"Your island Blocks folder was not found.")
                     local chests={}
+                    local _,_,playerRoot=getCharacter()
+                    assert(playerRoot,"Wait for your character before starting chest pickup.")
                     for _,block in ipairs(blocks:GetChildren()) do
                         if block.Name=="chestLargeIndustrialIO" and block:FindFirstChild("Contents") then
-                            table.insert(chests,block)
+                            local part=chestPart(block)
+                            local distance=part and (playerRoot.Position-part.Position).Magnitude or math.huge
+                            if not nearbyOnly or distance<=nearbyRange then
+                                table.insert(chests,{block=block,distance=distance})
+                            end
                         end
                     end
+                    table.sort(chests,function(a,b) return a.distance<b.distance end)
                     local found=#chests
-                    for chestIndex,chest in ipairs(chests) do
+                    for chestIndex,entry in ipairs(chests) do
                         if not running or generation~=token then break end
-                        if not moveToChest(chest,chestIndex,found,token) then break end
+                        local chest=entry.block
+                        if not nearbyOnly and not moveToChest(chest,chestIndex,found,token) then break end
                         local contents=chest:FindFirstChild("Contents")
                         local didOpen=false
                         local opened,openError=pcall(function()
@@ -1280,6 +1302,7 @@ local function installChestPickup()
                             toggleRemote:InvokeServer({chest=chest,open=true})
                             didOpen=true
                             task.wait(0.15)
+                            local pending={}
                             if contents then
                                 for _,item in ipairs(contents:GetChildren()) do
                                     if not running or generation~=token then break end
@@ -1297,29 +1320,33 @@ local function installChestPickup()
                                             error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
                                         end
                                         lastRequested[item]=amount
-                                        local changed=false
-                                        for _=1,20 do
-                                            if not running or generation~=token then break end
-                                            local remaining=contents:FindFirstChild(item.Name)
-                                            if item.Parent~=contents or not item.Parent
-                                                or (remaining and remaining:FindFirstChild("Amount")
-                                                    and (tonumber(remaining.Amount.Value) or amount)<amount)
-                                                or inventoryAmount(item.Name)>inventoryBefore then
-                                                changed=true;break
-                                            end
-                                            task.wait(0.1)
-                                        end
-                                        if changed then
-                                            total=total+1
-                                            lastResult="Confirmed "..item.Name.." × "..amount
-                                            status:SetDesc("Withdrawn "..total.." stack(s). Latest: "..lastResult)
-                                        else
-                                            lastResult="No visible change after requesting "..item.Name.." × "..amount
-                                            status:SetDesc(lastResult..". Check inventory space and chest permissions; request will not repeat automatically.")
-                                        end
+                                        table.insert(pending,{item=item,name=item.Name,amount=amount,inventoryBefore=inventoryBefore})
+                                        status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
                                         task.wait(delaySeconds)
                                     end
                                 end
+                            end
+                            -- Let the server replicate all stack results once per chest instead of
+                            -- waiting up to two seconds after every individual item request.
+                            if #pending>0 then task.wait(0.5) end
+                            local confirmed,unchanged=0,0
+                            for _,request in ipairs(pending) do
+                                local remaining=contents and contents:FindFirstChild(request.name)
+                                local changed=request.item.Parent~=contents or not request.item.Parent
+                                    or (remaining and remaining:FindFirstChild("Amount")
+                                        and (tonumber(remaining.Amount.Value) or request.amount)<request.amount)
+                                    or inventoryAmount(request.name)>request.inventoryBefore
+                                if changed then
+                                    total=total+1
+                                    confirmed=confirmed+1
+                                    lastResult="Confirmed "..request.name.." × "..request.amount
+                                else
+                                    unchanged=unchanged+1
+                                    lastResult="No visible change for "..request.name.." × "..request.amount
+                                end
+                            end
+                            if #pending>0 then
+                                status:SetDesc("Chest "..chestIndex.." / "..found..": "..confirmed.." confirmed, "..unchanged.." unchanged; "..total.." stack(s) confirmed total.")
                             end
                         end)
                         local closed,closeError=true,nil
@@ -1331,9 +1358,12 @@ local function installChestPickup()
                     end
                     if not running or generation~=token then break end
                     if found==0 then
-                        status:SetDesc("No chestLargeIndustrialIO chests found on your island.")
+                        status:SetDesc(nearbyOnly
+                            and ("No large industrial chests within "..nearbyRange.." studs.")
+                            or "No chestLargeIndustrialIO chests found on your island.")
                     else
-                        status:SetDesc("Watching "..found.." large industrial chest(es); "..total.." confirmed stack(s). "..tostring(lastResult or "Turn off to stop."))
+                        status:SetDesc((nearbyOnly and ("Swept "..found.." nearby chest(es); ") or ("Watching "..found.." large industrial chest(es); "))
+                            ..total.." confirmed stack(s). "..tostring(lastResult or "Turn off to stop."))
                     end
                     task.wait(1)
                 end
