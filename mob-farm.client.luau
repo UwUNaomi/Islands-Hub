@@ -40,6 +40,7 @@ end
 local Main = Window:AddTab({ Title = "Combat", Icon = "sword" })
 local Cutting = Window:AddTab({ Title = "Cutting", Icon = "axe" })
 local Farming = Window:AddTab({ Title = "Farming", Icon = "leaf" })
+local Auto = Window:AddTab({ Title = "Auto", Icon = "package" })
 local AutoBuild = Window:AddTab({ Title = "Autobuild", Icon = "building-2" })
 local GhostPreview = Window:AddTab({ Title = "Ghost Preview", Icon = "eye" })
 local BuildFiles = Window:AddTab({ Title = "Build Files", Icon = "folder" })
@@ -78,6 +79,7 @@ local farmToggle, auraToggle
 local treeFarmToggle, treeAuraToggle
 local stopCutting
 local stopAutoBuild
+local stopChestPickup
 local stopFarming, resolveCropPlacement
 local stopBossFarm, runBossOnce, setBossStatus
 local generation = 0
@@ -1143,6 +1145,117 @@ Settings:AddButton({
     Title = "Refresh Combat Remotes",
     Callback = function() task.spawn(refreshCombat) end,
 })
+
+-- Reuses the original script's ordinary CLIENT_CHEST_TRANSACTION withdraw
+-- request, restricted to large industrial chests in the local player's island.
+local function installChestPickup()
+    local section=Auto:AddSection("CHEST PICKUP")
+    local status=Auto:AddParagraph({Title="Chest Pickup Status",Content="Off. Scans only chestLargeIndustrialIO on your own island."})
+    local running,generation=false,0
+    local delaySeconds=0.1
+    local toggle=section:AddToggle("ChestPickupEnabled",{
+        Title="Auto Empty Large Industrial Chests",
+        Description="Withdraws stored items from chestLargeIndustrialIO chests on your own island.",
+        Default=false,
+    })
+    section:AddSlider("ChestPickupDelay",{
+        Title="Delay Between Items (seconds)",Description="Short pauses between normal withdraw requests.",
+        Default=0.1,Min=0.05,Max=1,Rounding=2,Callback=function(value) delaySeconds=value end,
+    })
+    local function ownBlockFolder()
+        local islands=workspace:FindFirstChild("Islands")
+        if not islands then return nil end
+        for _,island in ipairs(islands:GetChildren()) do
+            local owners=island:FindFirstChild("Owners")
+            local blocks=island:FindFirstChild("Blocks")
+            if blocks and owners and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then return blocks end
+        end
+        return nil
+    end
+    local function chestRemote()
+        local net=ReplicatedStorage
+        for _,name in ipairs({"rbxts_include","node_modules","@rbxts","net","out","_NetManaged"}) do
+            net=net and net:FindFirstChild(name)
+        end
+        local remote=net and net:FindFirstChild("CLIENT_CHEST_TRANSACTION")
+        assert(remote and remote:IsA("RemoteFunction"),"CLIENT_CHEST_TRANSACTION was not found; save a chest interaction diagnostic.")
+        return remote
+    end
+    local function amountOf(item)
+        local amount=item:FindFirstChild("Amount")
+        local value=amount and tonumber(amount.Value)
+        assert(value and value>0,"Stored item has no positive Amount value: "..item.Name)
+        return value
+    end
+    toggle:OnChanged(function(enabled)
+        generation=generation+1
+        local token=generation
+        running=enabled
+        if not enabled then
+            status:SetDesc("Stopped. Any withdraw request already sent may still finish.")
+            return
+        end
+        task.spawn(function()
+            local ok,err=xpcall(function()
+                local remote=chestRemote()
+                local lastRequested=setmetatable({}, {__mode="k"})
+                local total,chests=0,0
+                status:SetDesc("Scanning your island for large industrial chests...")
+                while running and generation==token do
+                    local blocks=ownBlockFolder()
+                    assert(blocks,"Your island Blocks folder was not found.")
+                    local found=0
+                    for _,chest in ipairs(blocks:GetChildren()) do
+                        if not running or generation~=token then break end
+                        if chest.Name=="chestLargeIndustrialIO" then
+                            local contents=chest:FindFirstChild("Contents")
+                            if contents then
+                                found=found+1
+                                chests=math.max(chests,found)
+                                for _,item in ipairs(contents:GetChildren()) do
+                                    if not running or generation~=token then break end
+                                    local amount=amountOf(item)
+                                    if lastRequested[item]~=amount then
+                                        local response=remote:InvokeServer({
+                                            chest=chest,
+                                            player_tracking_category="join_from_web",
+                                            amount=amount,
+                                            tool=item,
+                                            action="withdraw",
+                                        })
+                                        assert(type(response)=="table" and response.success==true,
+                                            "Withdraw was not confirmed for "..item.Name..": "..tostring(response))
+                                        lastRequested[item]=amount
+                                        total=total+1
+                                        status:SetDesc("Withdrawn "..total.." item stacks from "..chests.." large industrial chest(es). Latest: "..item.Name.." × "..amount)
+                                        task.wait(delaySeconds)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if not running or generation~=token then break end
+                    if found==0 then
+                        status:SetDesc("No chestLargeIndustrialIO chests found on your island.")
+                    else
+                        status:SetDesc("Watching "..found.." large industrial chest(es); "..total.." item stacks withdrawn. Turn off to stop.")
+                    end
+                    task.wait(1)
+                end
+            end,debug.traceback)
+            if not ok and generation==token then
+                running=false
+                toggle:SetValue(false)
+                status:SetDesc("Chest pickup stopped: "..tostring(err))
+            end
+        end)
+    end)
+    stopChestPickup=function()
+        generation=generation+1
+        running=false
+    end
+end
+installChestPickup()
 
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
@@ -2937,6 +3050,7 @@ installBossFarm()
 
 local function shutdown()
     if not state.running then return end
+    if stopChestPickup then stopChestPickup() end
     if stopBossFarm then stopBossFarm() end
     if stopFarming then stopFarming() end
     state.running = false
