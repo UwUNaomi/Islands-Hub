@@ -1294,6 +1294,8 @@ local function installChestPickup()
             status:SetDesc("Stopped. Any withdraw request already sent may still finish.")
             return
         end
+        local startChestWorker
+        startChestWorker=function()
         task.spawn(function()
             local ok,err=xpcall(function()
                 local remote=chestRemote()
@@ -1407,11 +1409,14 @@ local function installChestPickup()
             end,debug.traceback)
             if not ok and generation==token then
                 if activeTween then activeTween:Cancel();activeTween=nil end
-                running=false
-                toggle:SetValue(false)
-                status:SetDesc("Chest pickup stopped: "..tostring(err))
+                status:SetDesc("Chest scan error; keeping Auto on and retrying: "..tostring(err))
+                warn("[RoSnipe Chest Pickup] Continuing after error: "..tostring(err))
+                task.wait(1)
+                if running and generation==token then startChestWorker() end
             end
         end)
+        end
+        startChestWorker()
     end)
     stopChestPickup=function(releaseHover)
         generation=generation+1
