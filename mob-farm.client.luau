@@ -1146,7 +1146,7 @@ Settings:AddButton({
 
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
-    local build = { speed = 5, travelSpeed = 25, teleport = true, moveNear = false, autoReach = true, useRadius = false, radius = 85,
+    local build = { speed = 10, nearbyFirst = true, travelSpeed = 25, teleport = true, moveNear = false, autoReach = true, useRadius = false, radius = 85,
         retryPasses = 4, showHUD = true, noclip = true, paused = false, saveName = "mybuild", collision = false, records = {},
         version = 0, busy = false, mode = nil, file = "Template", folder = "RoSnipe/Schematica", loadNearPlayer = true, events = {}, actions = {} }
     local function trace(kind, message)
@@ -1216,7 +1216,7 @@ local function installAutoBuild()
             pendingRequest=pendingRequest and not pendingRequest.done or false,
             placeRemote=placeRemote and placeRemote:GetFullName() or "unresolved", hashResolved=placeKey~=nil and placeHash~=nil,
             handleMode=build.handleMode or "none", handlesVisible=handles.Visible, handlesAdornee=handles.Adornee and handles.Adornee:GetFullName() or "none",
-            minimized=Window.Minimized, speed=build.speed, travelSpeed=build.travelSpeed, teleport=build.teleport, autoReach=build.autoReach, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
+            minimized=Window.Minimized, speed=build.speed, nearbyFirst=build.nearbyFirst, travelSpeed=build.travelSpeed, teleport=build.teleport, autoReach=build.autoReach, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
             actions=actions, events=events,
         }
     end
@@ -1805,6 +1805,62 @@ local function installAutoBuild()
         assert(request.ok, tostring(request.result))
         return true, request.result~=false
     end
+    -- One batch owns the request guard until every dispatched call has returned,
+    -- including when Stop is pressed. No travel or next job while calls linger.
+    local function invokePlacementBatch(entries, current, waitReady, root, onSent)
+        assert(not pendingRequest or pendingRequest.done,"Previous build request is still waiting for the server.")
+        local batch={done=false,active=0,closed=false,calls={}}
+        pendingRequest=batch
+        local function finish()
+            batch.done=batch.closed and batch.active==0
+        end
+        local function checkReplies()
+            for _,call in ipairs(batch.calls) do
+                if call.sentAt and not call.done and os.clock()-call.sentAt>=8 then
+                    error("Placement request timed out. Stop; wait for the server before retrying.",0)
+                end
+                if call.done and call.error then error(call.error,0) end
+            end
+        end
+        local ok,err=pcall(function()
+            local nextSend=0
+            for _,entry in ipairs(entries) do
+                while current() and (batch.active>=3 or os.clock()<nextSend) do
+                    checkReplies();task.wait(0.02)
+                end
+                if not waitReady() then break end
+                checkReplies()
+                local call={done=false}
+                table.insert(batch.calls,call)
+                batch.active=batch.active+1
+                task.spawn(function()
+                    local sentOk,sendError=pcall(function()
+                        if not waitReady() then return end
+                        -- Never move the character from a worker. Re-group an
+                        -- unsent block if the character drifted outside reach.
+                        if (root.Position-entry.record.cf.Position).Magnitude>28 then return end
+                        call.sentAt=os.clock()
+                        entry.sent=true
+                        onSent(entry.record)
+                        local reply=placeRemote:InvokeServer({[placeKey]=placeHash,cframe=entry.record.cf,
+                            blockType=entry.record.name,upperBlock=entry.record.upperBlock==true})
+                        if reply==false then trace("placement rejected",entry.record.name.."; will recheck next pass") end
+                    end)
+                    if not sentOk then call.error=tostring(sendError) end
+                    call.done=true
+                    batch.active=batch.active-1
+                    finish()
+                end)
+                nextSend=os.clock()+1/math.clamp(build.speed,1,20)
+            end
+            batch.closed=true;finish()
+            while current() and not batch.done do checkReplies();task.wait(0.02) end
+            if current() then checkReplies() end
+        end)
+        batch.closed=true;finish()
+        if not ok then error(err,0) end
+        return current()
+    end
     local function startJob(kind, records, instant, missingOnly)
         ensureIdle()
         assert(#records>0 and #records<=MAX_BLOCKS, kind=="place" and "Load a ghost preview or select 1–20000 blocks first."
@@ -1906,7 +1962,7 @@ local function installAutoBuild()
                     holdPosition=root.Position
                     if frozen then frozen.Position=holdPosition end
                 end
-                if not build.moveNear then return true end
+                if not build.moveNear or (kind=="place" and build.nearbyFirst) then return true end
             end
             assert(canMove(),"Target out of reach ("..math.floor(distance).." studs). Enable Auto Reach Floating Blocks or Move To Build Position.")
             local destination=record.cf.Position+Vector3.new(0,10,0)
@@ -1991,49 +2047,95 @@ local function installAutoBuild()
                     end)
                 end
                 local requests,confirmed=0,0
+                local function placeNearby(queue, pass)
+                    local remaining={}
+                    for i,record in ipairs(queue) do remaining[i]=record end
+                    local emptyBatches=0
+                    while waitReady() do
+                        local entries,nearest,nearestDistance={},nil,math.huge
+                        local center=root.Position
+                        -- The pass is sorted bottom-up; keep that order inside
+                        -- each local group so lower blocks are dispatched first.
+                        for index,record in ipairs(remaining) do
+                            if record then
+                                local distance=(record.cf.Position-center).Magnitude
+                                if distance<nearestDistance then nearest,nearestDistance=record,distance end
+                                if distance<=28 and #entries<64 then
+                                    table.insert(entries,{record=record,index=index})
+                                end
+                            end
+                        end
+                        if not nearest then return end
+                        if #entries==0 then
+                            if not ensureReach(nearest) then return end
+                        else
+                            -- Hold this spot until all calls for the group end.
+                            if canMove() then
+                                syncMovement();holdPosition=root.Position
+                                if frozen then frozen.Position=holdPosition end
+                            end
+                            report.phase=pass==1 and "Placing nearby" or ("Retry "..(pass-1).." nearby")
+                            if not invokePlacementBatch(entries,current,waitReady,root,function(record)
+                                requests=requests+1;report.sent=requests;report.currentName=record.name
+                            end) then return end
+                            local sent=0
+                            for _,entry in ipairs(entries) do
+                                if entry.sent then remaining[entry.index]=false;sent=sent+1 end
+                            end
+                            emptyBatches=sent>0 and 0 or emptyBatches+1
+                            assert(emptyBatches<3,"Character repeatedly moved out of range before placement. Stop other movement scripts, then retry.")
+                            renderBOM()
+                            status("Placed "..report.placed.." / "..report.total.." | nearby group: "..sent.." requests sent")
+                        end
+                    end
+                end
                 local passes=kind=="place" and (1+build.retryPasses) or 1
-                local queue=(missingOnly and missing) or records
+                local queue=kind=="place" and missing or records
                 for pass=1,passes do
                     if not waitReady() or #queue==0 then break end
                     arrange(queue)
-                    for index,record in ipairs(queue) do
-                        if not waitReady() then break end
-                        if kind~="place" then assert(tool.Parent==character,"Building tool changed; job stopped.") end
-                        if report then
-                            report.phase,report.currentName=pass==1 and "Placing" or ("Retry "..(pass-1)),record.name
-                            renderBOM()
-                        end
-                        if kind=="place" then
-                            local sent,accepted=invoke(placeRemote,{[placeKey]=placeHash,cframe=record.cf,blockType=record.name,upperBlock=record.upperBlock==true},current,waitReady,
-                                function() return ensureReach(record) end)
-                            if not sent then break end
-                            requests=requests+1;report.sent=requests
-                            if not accepted then trace("placement rejected",record.name.."; will recheck on the next pass") end
-                            renderBOM()
-                        else
-                            assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
-                            status("Breaking "..index.." / "..#queue..": "..record.name.." | "..tool.Name)
-                            for _=1,instant and 1 or 40 do
-                                if not waitReady() or not record.block.Parent then break end
-                                assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
-                                local sent,accepted=invoke(treeRemote,{[treeHashKey]=treeHashValue,part=record.part,block=record.block,
-                                    norm=record.part.CFrame.UpVector,pos=record.part.Position},current,waitReady,
+                    if kind=="place" and build.nearbyFirst then
+                        placeNearby(queue,pass)
+                    else
+                        for index,record in ipairs(queue) do
+                            if not waitReady() then break end
+                            if kind~="place" then assert(tool.Parent==character,"Building tool changed; job stopped.") end
+                            if report then
+                                report.phase,report.currentName=pass==1 and "Placing" or ("Retry "..(pass-1)),record.name
+                                renderBOM()
+                            end
+                            if kind=="place" then
+                                local sent,accepted=invoke(placeRemote,{[placeKey]=placeHash,cframe=record.cf,blockType=record.name,upperBlock=record.upperBlock==true},current,waitReady,
                                     function() return ensureReach(record) end)
                                 if not sent then break end
-                                assert(accepted,"Server rejected the block hit.")
-                                requests=requests+1
-                                task.wait(instant and 1/build.speed or 0.3)
+                                requests=requests+1;report.sent=requests
+                                if not accepted then trace("placement rejected",record.name.."; will recheck on the next pass") end
+                                renderBOM()
+                            else
+                                assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
+                                status("Breaking "..index.." / "..#queue..": "..record.name.." | "..tool.Name)
+                                for _=1,instant and 1 or 40 do
+                                    if not waitReady() or not record.block.Parent then break end
+                                    assert(tool.Parent==character,"Pickaxe unequipped. Re-equip it, then restart Destroy Blocks.")
+                                    local sent,accepted=invoke(treeRemote,{[treeHashKey]=treeHashValue,part=record.part,block=record.block,
+                                        norm=record.part.CFrame.UpVector,pos=record.part.Position},current,waitReady,
+                                        function() return ensureReach(record) end)
+                                    if not sent then break end
+                                    assert(accepted,"Server rejected the block hit.")
+                                    requests=requests+1
+                                    task.wait(instant and 1/build.speed or 0.3)
+                                end
+                                if not record.block.Parent then confirmed=confirmed+1 end
+                                if current() and record.block.Parent then
+                                    error("Block still present after repeated hits: "..record.name..". Hit it once manually with your pickaxe, then click Save Destroy Diagnostic.",0)
+                                end
                             end
-                            if not record.block.Parent then confirmed=confirmed+1 end
-                            if current() and record.block.Parent then
-                                error("Block still present after repeated hits: "..record.name..". Hit it once manually with your pickaxe, then click Save Destroy Diagnostic.",0)
+                            if not build.paused then
+                                status(report and ("Placed "..report.placed.." / "..report.total.." | "..report.phase.." "..record.name)
+                                    or ("Destroying "..index.."/"..#queue))
                             end
+                            task.wait(1/build.speed)
                         end
-                        if not build.paused then
-                            status(report and ("Placed "..report.placed.." / "..report.total.." | "..report.phase.." "..record.name)
-                                or ("Destroying "..index.."/"..#queue))
-                        end
-                        task.wait(1/build.speed)
                     end
                     if report and waitReady() then
                         task.wait(0.5)
@@ -2055,7 +2157,7 @@ local function installAutoBuild()
             end,traceback)
             releaseMovement()
             if build.releaseMovement==releaseMovement then build.releaseMovement=nil end
-            if current() and moved then root.CFrame=original end
+            if current() and moved and (not pendingRequest or pendingRequest.done) then root.CFrame=original end
             build.busy,build.paused=false,false
             if report and state.running then
                 if not ok then report.phase="Error";report.currentName=nil
@@ -2169,6 +2271,7 @@ local function installAutoBuild()
     toggle(settings,"BuildAutoReach","Auto Reach Floating Blocks","Automatically move within reach and hover for elevated placements, even with Move To Build Position off.",true,function(v) build.autoReach=v end)
     settings:AddSlider("BuildTravelSpeed",{Title="Build Travel Speed",Description="Gradual movement in studs per second.",Default=25,Min=5,Max=60,Rounding=0,Callback=function(v) build.travelSpeed=v end})
     local controls=AutoBuild:AddSection("AUTOBUILD")
+    toggle(controls,"BuildNearbyFirst","Place Nearby Blocks First","Place blocks within 28 studs before moving again; up to 3 requests in flight. Overrides Move Near Block Before Placing.",true,function(v) build.nearbyFirst=v end)
     toggle(controls,"BuildTeleport","Move To Build Position","Moves within reach as the build progresses.",true,function(v) build.teleport=v end)
     toggle(controls,"BuildUseRadius","Use Build Radius","Prioritizes blocks inside your radius first; remaining blocks follow.",false,function(v) build.useRadius=v end)
     controls:AddSlider("BuildRadius",{Title="Build Radius",Default=85,Min=10,Max=200,Rounding=0,Callback=function(v) build.radius=v end})
@@ -2195,7 +2298,7 @@ local function installAutoBuild()
         bomGui.Enabled=not bomGui.Enabled
         renderBOM()
     end)
-    controls:AddSlider("BuildSpeed",{Title="Build Speed (requests/sec)",Default=5,Min=1,Max=20,Rounding=0,Callback=function(v) build.speed=v;redraw() end})
+    controls:AddSlider("BuildSpeed",{Title="Build Speed (requests/sec)",Description="Requested send rate; actual placement speed depends on the server.",Default=10,Min=1,Max=20,Rounding=0,Callback=function(v) build.speed=v;redraw() end})
 
     local movement=GhostPreview:AddSection("GHOST MOVEMENT")
     toggle(movement,"BuildMoveTool","Enable Moving Tool","Drag the ghost preview using its handles.",false,function(value)
