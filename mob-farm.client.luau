@@ -1221,6 +1221,20 @@ local function installChestPickup()
         assert(value and value>0,"Stored item has no positive Amount value: "..item.Name)
         return value
     end
+    local function inventoryAmount(itemName)
+        local total=0
+        for _,container in ipairs({LocalPlayer:FindFirstChild("Backpack"),LocalPlayer.Character}) do
+            if container then
+                for _,item in ipairs(container:GetChildren()) do
+                    if item.Name==itemName then
+                        local amount=item:FindFirstChild("Amount")
+                        total=total+(amount and tonumber(amount.Value) or 1)
+                    end
+                end
+            end
+        end
+        return total
+    end
     toggle:OnChanged(function(enabled)
         generation=generation+1
         local token=generation
@@ -1234,7 +1248,7 @@ local function installChestPickup()
             local ok,err=xpcall(function()
                 local remote=chestRemote()
                 local lastRequested=setmetatable({}, {__mode="k"})
-                local total,chests=0,0
+                local total,chests,lastResult=0,0,nil
                 status:SetDesc("Scanning your island for large industrial chests...")
                 while running and generation==token do
                     local blocks=ownBlockFolder()
@@ -1255,6 +1269,7 @@ local function installChestPickup()
                                 if not running or generation~=token then break end
                                 local amount=amountOf(item)
                                 if lastRequested[item]~=amount then
+                                    local inventoryBefore=inventoryAmount(item.Name)
                                     local response=remote:InvokeServer({
                                         chest=chest,
                                         player_tracking_category="join_from_web",
@@ -1262,11 +1277,30 @@ local function installChestPickup()
                                         tool=item,
                                         action="withdraw",
                                     })
-                                    assert(type(response)=="table" and response.success==true,
-                                        "Withdraw was not confirmed for "..item.Name..": "..tostring(response))
+                                    if response==false or (type(response)=="table" and response.success==false) then
+                                        error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
+                                    end
                                     lastRequested[item]=amount
-                                    total=total+1
-                                    status:SetDesc("Chest "..chestIndex.." / "..found.." | withdrew "..item.Name.." × "..amount.." | "..total.." stack(s) total.")
+                                    local changed=false
+                                    for _=1,20 do
+                                        if not running or generation~=token then break end
+                                        local remaining=contents:FindFirstChild(item.Name)
+                                        if item.Parent~=contents or not item.Parent
+                                            or (remaining and remaining:FindFirstChild("Amount")
+                                                and (tonumber(remaining.Amount.Value) or amount)<amount)
+                                            or inventoryAmount(item.Name)>inventoryBefore then
+                                            changed=true;break
+                                        end
+                                        task.wait(0.1)
+                                    end
+                                    if changed then
+                                        total=total+1
+                                        lastResult="Confirmed "..item.Name.." × "..amount
+                                        status:SetDesc("Withdrawn "..total.." stack(s). Latest: "..lastResult)
+                                    else
+                                        lastResult="No visible change after requesting "..item.Name.." × "..amount
+                                        status:SetDesc(lastResult..". Check inventory space and chest permissions; request will not repeat automatically.")
+                                    end
                                     task.wait(delaySeconds)
                                 end
                             end
@@ -1276,7 +1310,7 @@ local function installChestPickup()
                     if found==0 then
                         status:SetDesc("No chestLargeIndustrialIO chests found on your island.")
                     else
-                        status:SetDesc("Watching "..found.." large industrial chest(es); "..total.." item stacks withdrawn. Turn off to stop.")
+                        status:SetDesc("Watching "..found.." large industrial chest(es); "..total.." confirmed stack(s). "..tostring(lastResult or "Turn off to stop."))
                     end
                     task.wait(1)
                 end
