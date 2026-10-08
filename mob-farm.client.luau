@@ -1158,6 +1158,7 @@ local function installChestPickup()
     local nearbyRange=12
     local activeTween
     local chestHover
+    local chestCollisionState={}
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
         Description="Uses the original ChestAura pattern: request each stored stack in one pass.",
@@ -1199,6 +1200,22 @@ local function installChestPickup()
         end
         return chestHover
     end
+    local function setChestNoclip(enabled)
+        local character=LocalPlayer.Character
+        if enabled and character then
+            for _,part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if chestCollisionState[part]==nil then chestCollisionState[part]=part.CanCollide end
+                    part.CanCollide=false
+                end
+            end
+        else
+            for part,canCollide in pairs(chestCollisionState) do
+                if part.Parent then part.CanCollide=canCollide end
+                chestCollisionState[part]=nil
+            end
+        end
+    end
     local function moveToChest(chest,number,total,token)
         local character,humanoid,root=getCharacter()
         assert(character,"Wait for your character before starting chest pickup.")
@@ -1211,6 +1228,7 @@ local function installChestPickup()
         if horizontal.Magnitude<0.1 then horizontal=Vector3.new(0,0,1) end
         local destination=part.Position+Vector3.new(0,3,0)+horizontal.Unit*5
         local hover=ensureChestHover(root)
+        setChestNoclip(true)
         local startPosition=root.Position
         local safeY=math.max(startPosition.Y,part.Position.Y+10)
         local waypoints={
@@ -1233,15 +1251,21 @@ local function installChestPickup()
                     -- Keep the BodyPosition at its current goal if cancelled so the character
                     -- does not drop while the user stops or changes the chest scan.
                     if root.Parent then hover.Position=root.Position end
+                    setChestNoclip(false)
                     return false
                 end
             end
         end
         for _=1,30 do
-            if not running or generation~=token then hover.Position=root.Position;return false end
+            if not running or generation~=token then
+                hover.Position=root.Position
+                setChestNoclip(false)
+                return false
+            end
             if (root.Position-part.Position).Magnitude<=14 then break end
             task.wait(0.1)
         end
+        setChestNoclip(false)
         assert((root.Position-part.Position).Magnitude<=14,
             "Flight ended outside chest range ("..math.floor((root.Position-part.Position).Magnitude).." studs).")
         return true
@@ -1291,6 +1315,7 @@ local function installChestPickup()
         running=enabled
         if not enabled then
             if activeTween then activeTween:Cancel();activeTween=nil end
+            setChestNoclip(false)
             status:SetDesc("Stopped. Any withdraw request already sent may still finish.")
             return
         end
@@ -1409,6 +1434,7 @@ local function installChestPickup()
             end,debug.traceback)
             if not ok and generation==token then
                 if activeTween then activeTween:Cancel();activeTween=nil end
+                setChestNoclip(false)
                 status:SetDesc("Chest scan error; keeping Auto on and retrying: "..tostring(err))
                 warn("[RoSnipe Chest Pickup] Continuing after error: "..tostring(err))
                 task.wait(1)
@@ -1422,6 +1448,7 @@ local function installChestPickup()
         generation=generation+1
         running=false
         if activeTween then activeTween:Cancel();activeTween=nil end
+        setChestNoclip(false)
         if releaseHover then releaseChestHover() end
     end
 end
