@@ -1164,11 +1164,11 @@ local function installChestPickup()
     })
     section:AddSlider("ChestPickupDelay",{
         Title="Delay Between Requests (seconds)",Description="Optional pause between the original per-stack withdraw requests.",
-        Default=0,Min=0,Max=1,Rounding=2,Callback=function(value) delaySeconds=value end,
+        Default=0,Min=0,Max=1,Rounding=2,Callback=function(value) delaySeconds=tonumber(value) or 0 end,
     })
     section:AddSlider("ChestPickupTravelSpeed",{
         Title="Chest Travel Speed",Description="Tween speed in studs per second.",
-        Default=35,Min=10,Max=100,Rounding=0,Callback=function(value) travelSpeed=value end,
+        Default=35,Min=10,Max=100,Rounding=0,Callback=function(value) travelSpeed=tonumber(value) or 35 end,
     })
     section:AddToggle("ChestPickupNearbyOnly",{
         Title="Only Chests in Range",Description="Sweep nearby chests without moving; keep the range within normal chest reach.",
@@ -1176,7 +1176,7 @@ local function installChestPickup()
     })
     section:AddSlider("ChestPickupRange",{
         Title="Nearby Chest Range (studs)",Description="Maximum distance for the nearby-only sweep.",
-        Default=12,Min=4,Max=14,Rounding=0,Callback=function(value) nearbyRange=value end,
+        Default=12,Min=4,Max=14,Rounding=0,Callback=function(value) nearbyRange=tonumber(value) or 12 end,
     })
     local function chestPart(chest)
         local part=chest:IsA("BasePart") and chest or chest:FindFirstChild("Root",true)
@@ -1309,7 +1309,8 @@ local function installChestPickup()
                                     lastRequested[item]=amount
                                     table.insert(pending,{item=item,name=item.Name,amount=amount})
                                     status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
-                                    if delaySeconds>0 then task.wait(delaySeconds) end
+                                    local pause=tonumber(delaySeconds) or 0
+                                    if pause>0 then task.wait(pause) end
                                 end
                             end
                         end
