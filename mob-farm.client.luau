@@ -1156,9 +1156,9 @@ local function installChestPickup()
     local travelSpeed=35
     local nearbyOnly=true
     local nearbyRange=12
-    local activeTween
     local chestHover
     local chestCollisionState={}
+    local chestNoclipConnection
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
         Description="Uses the original ChestAura pattern: request each stored stack in one pass.",
@@ -1203,13 +1203,22 @@ local function installChestPickup()
     local function setChestNoclip(enabled)
         local character=LocalPlayer.Character
         if enabled and character then
-            for _,part in ipairs(character:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    if chestCollisionState[part]==nil then chestCollisionState[part]=part.CanCollide end
-                    part.CanCollide=false
+            local function disableCollisions()
+                local current=LocalPlayer.Character
+                if not current then return end
+                for _,part in ipairs(current:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        if chestCollisionState[part]==nil then chestCollisionState[part]=part.CanCollide end
+                        part.CanCollide=false
+                    end
                 end
             end
+            disableCollisions()
+            if not chestNoclipConnection then
+                chestNoclipConnection=RunService.Heartbeat:Connect(disableCollisions)
+            end
         else
+            if chestNoclipConnection then chestNoclipConnection:Disconnect();chestNoclipConnection=nil end
             for part,canCollide in pairs(chestCollisionState) do
                 if part.Parent then part.CanCollide=canCollide end
                 chestCollisionState[part]=nil
@@ -1239,22 +1248,23 @@ local function installChestPickup()
         local distance=(startPosition-destination).Magnitude
         status:SetDesc("Moving to chest "..number.." / "..total.." ("..math.floor(distance).." studs)...")
         for _,point in ipairs(waypoints) do
-            local leg=(hover.Position-point).Magnitude
-            if leg>1 then
-                activeTween=game:GetService("TweenService"):Create(hover,
-                    TweenInfo.new(leg/math.max(travelSpeed,1),Enum.EasingStyle.Linear),
-                    {Position=point})
-                activeTween:Play()
-                local result=activeTween.Completed:Wait()
-                activeTween=nil
-                if not running or generation~=token or result~=Enum.PlaybackState.Completed then
-                    -- Keep the BodyPosition at its current goal if cancelled so the character
-                    -- does not drop while the user stops or changes the chest scan.
-                    if root.Parent then hover.Position=root.Position end
-                    setChestNoclip(false)
-                    return false
-                end
+            while running and generation==token and (root.Position-point).Magnitude>2 do
+                local delta=point-root.Position
+                local step=math.min(delta.Magnitude,math.clamp(tonumber(travelSpeed) or 35,5,60)*0.05)
+                local nextPosition=root.Position+delta.Unit*step
+                setChestNoclip(true)
+                hover.Position=nextPosition
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
+                root.CFrame=CFrame.new(nextPosition)*root.CFrame.Rotation
+                task.wait(0.05)
             end
+            if not running or generation~=token then
+                if root.Parent then hover.Position=root.Position end
+                setChestNoclip(false)
+                return false
+            end
+            hover.Position=root.Position
         end
         for _=1,30 do
             if not running or generation~=token then
@@ -1314,7 +1324,6 @@ local function installChestPickup()
         local token=generation
         running=enabled
         if not enabled then
-            if activeTween then activeTween:Cancel();activeTween=nil end
             setChestNoclip(false)
             status:SetDesc("Stopped. Any withdraw request already sent may still finish.")
             return
@@ -1349,75 +1358,85 @@ local function installChestPickup()
                         local chest=entry.block
                         if not nearbyOnly and not moveToChest(chest,chestIndex,found,token) then break end
                         local contents=chest:FindFirstChild("Contents")
-                        local pending={}
-                        local inventoryBeforeByName={}
-                        local rejectedThisChest=0
+                        local confirmedThisChest,rejectedThisChest=0,0
                         if contents then
                             for _,item in ipairs(contents:GetChildren()) do
                                 if not running or generation~=token then break end
-                                local amount=amountOf(item)
-                                if item.Parent==contents and lastRequested[item]~=amount then
-                                    if inventoryBeforeByName[item.Name]==nil then
-                                        inventoryBeforeByName[item.Name]=inventoryAmount(item.Name)
-                                    end
-                                    local invoked,response=pcall(function()
-                                        return remote:InvokeServer({
-                                            chest=chest,
-                                            player_tracking_category="join_from_web",
-                                            amount=amount,
-                                            tool=item,
-                                            action="withdraw",
-                                        })
-                                    end)
-                                    local wasRejected=not invoked or response==false
-                                        or (type(response)=="table" and response.success==false)
-                                    if wasRejected then
+                                local attempt=0
+                                while running and generation==token and item.Parent==contents do
+                                    attempt=attempt+1
+                                    local amountOk,amount=pcall(amountOf,item)
+                                    if not amountOk then
                                         rejected=rejected+1
                                         rejectedThisChest=rejectedThisChest+1
-                                        lastResult="Server rejected "..item.Name.." × "..amount.."; will retry"
-                                        status:SetDesc(lastResult.." and continue to the next stack.")
+                                        lastResult="Could not read "..item.Name.." stack; retrying"
+                                        status:SetDesc(lastResult.." on chest "..chestIndex.." / "..found.." (attempt "..attempt..").")
+                                        task.wait(0.5)
+                                    elseif lastRequested[item]==amount then
+                                        break
                                     else
-                                        lastRequested[item]=amount
-                                        table.insert(pending,{item=item,name=item.Name,amount=amount})
-                                        status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."...")
+                                        local inventoryBefore=inventoryAmount(item.Name)
+                                        local invoked,response=pcall(function()
+                                            return remote:InvokeServer({
+                                                chest=chest,
+                                                player_tracking_category="join_from_web",
+                                                amount=amount,
+                                                tool=item,
+                                                action="withdraw",
+                                            })
+                                        end)
+                                        local wasRejected=not invoked or response==false
+                                            or (type(response)=="table" and response.success==false)
+                                        if wasRejected then
+                                            rejected=rejected+1
+                                            rejectedThisChest=rejectedThisChest+1
+                                            lastResult="Server rejected "..item.Name.." × "..amount.."; retrying same stack"
+                                            status:SetDesc(lastResult.." (attempt "..attempt..").")
+                                            task.wait(0.5)
+                                        else
+                                            status:SetDesc("Requested "..item.Name.." × "..amount.." from chest "..chestIndex.." / "..found.."; waiting for transfer...")
+                                            local changed=false
+                                            for _=1,10 do
+                                                if not running or generation~=token then break end
+                                                local amountValue=item:FindFirstChild("Amount")
+                                                if item.Parent~=contents or not item.Parent
+                                                    or (amountValue and (tonumber(amountValue.Value) or amount)<amount)
+                                                    or inventoryAmount(item.Name)>inventoryBefore then
+                                                    changed=true
+                                                    break
+                                                end
+                                                task.wait(0.1)
+                                            end
+                                            if changed then
+                                                total=total+1
+                                                confirmedThisChest=confirmedThisChest+1
+                                                lastRequested[item]=amount
+                                                lastResult="Confirmed "..item.Name.." × "..amount
+                                                local amountValue=item:FindFirstChild("Amount")
+                                                local remaining=amountValue and tonumber(amountValue.Value)
+                                                if item.Parent==contents and remaining and remaining<amount then
+                                                    lastRequested[item]=nil
+                                                    task.wait(0.1)
+                                                else
+                                                    break
+                                                end
+                                            else
+                                                rejected=rejected+1
+                                                rejectedThisChest=rejectedThisChest+1
+                                                lastRequested[item]=nil
+                                                lastResult="No transfer confirmed for "..item.Name.." × "..amount.."; retrying same stack"
+                                                status:SetDesc(lastResult.." (attempt "..attempt..").")
+                                                task.wait(0.5)
+                                            end
+                                            local pause=tonumber(delaySeconds) or 0
+                                            if pause>0 then task.wait(pause) end
+                                        end
                                     end
-                                    local pause=tonumber(delaySeconds) or 0
-                                    if pause>0 then task.wait(pause) end
                                 end
                             end
                         end
-                        -- The OG sends every stack request in one pass. Check the resulting state
-                        -- after the pass; the RemoteFunction's nil return is not a success signal.
-                        if #pending>0 then task.wait(0.5) end
-                        local confirmed,unchanged=0,0
-                        local inventoryCredit={}
-                        for name,before in pairs(inventoryBeforeByName) do
-                            inventoryCredit[name]=math.max(0,inventoryAmount(name)-before)
-                        end
-                        for _,request in ipairs(pending) do
-                            local amountValue=request.item:FindFirstChild("Amount")
-                            local changed=request.item.Parent~=contents or not request.item.Parent
-                                or (amountValue and (tonumber(amountValue.Value) or request.amount)<request.amount)
-                            if changed then
-                                inventoryCredit[request.name]=math.max(0,(inventoryCredit[request.name] or 0)-request.amount)
-                            elseif (inventoryCredit[request.name] or 0)>=request.amount then
-                                changed=true
-                                inventoryCredit[request.name]=inventoryCredit[request.name]-request.amount
-                            end
-                            if changed then
-                                total=total+1
-                                confirmed=confirmed+1
-                                lastResult="Confirmed "..request.name.." × "..request.amount
-                            else
-                                unchanged=unchanged+1
-                                rejected=rejected+1
-                                rejectedThisChest=rejectedThisChest+1
-                                lastRequested[request.item]=nil
-                                lastResult="No visible change for "..request.name.." × "..request.amount.."; will retry"
-                            end
-                        end
-                        if #pending>0 or rejectedThisChest>0 then
-                            status:SetDesc("Chest "..chestIndex.." / "..found..": sent "..#pending.." request(s), "..confirmed.." confirmed, "..unchanged.." unchanged; "..rejectedThisChest.." rejected/queued to retry.")
+                        if confirmedThisChest>0 or rejectedThisChest>0 then
+                            status:SetDesc("Chest "..chestIndex.." / "..found..": "..confirmedThisChest.." stack transfer(s) confirmed; "..rejectedThisChest.." retry attempt(s).")
                         end
                     end
                     if not running or generation~=token then break end
@@ -1433,7 +1452,6 @@ local function installChestPickup()
                 end
             end,debug.traceback)
             if not ok and generation==token then
-                if activeTween then activeTween:Cancel();activeTween=nil end
                 setChestNoclip(false)
                 status:SetDesc("Chest scan error; keeping Auto on and retrying: "..tostring(err))
                 warn("[RoSnipe Chest Pickup] Continuing after error: "..tostring(err))
@@ -1447,7 +1465,6 @@ local function installChestPickup()
     stopChestPickup=function(releaseHover)
         generation=generation+1
         running=false
-        if activeTween then activeTween:Cancel();activeTween=nil end
         setChestNoclip(false)
         if releaseHover then releaseChestHover() end
     end
