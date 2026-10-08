@@ -1215,6 +1215,15 @@ local function installChestPickup()
         assert(remote and remote:IsA("RemoteFunction"),"CLIENT_CHEST_TRANSACTION was not found; save a chest interaction diagnostic.")
         return remote
     end
+    local function chestToggleRemote()
+        local net=ReplicatedStorage
+        for _,name in ipairs({"rbxts_include","node_modules","@rbxts","net","out","_NetManaged"}) do
+            net=net and net:FindFirstChild(name)
+        end
+        local remote=net and net:FindFirstChild("CHEST_TOGGLE")
+        assert(remote and remote:IsA("RemoteFunction"),"CHEST_TOGGLE RemoteFunction was not found.")
+        return remote
+    end
     local function amountOf(item)
         local amount=item:FindFirstChild("Amount")
         local value=amount and tonumber(amount.Value)
@@ -1247,6 +1256,7 @@ local function installChestPickup()
         task.spawn(function()
             local ok,err=xpcall(function()
                 local remote=chestRemote()
+                local toggleRemote=chestToggleRemote()
                 local lastRequested=setmetatable({}, {__mode="k"})
                 local total,chests,lastResult=0,0,nil
                 status:SetDesc("Scanning your island for large industrial chests...")
@@ -1264,47 +1274,60 @@ local function installChestPickup()
                         if not running or generation~=token then break end
                         if not moveToChest(chest,chestIndex,found,token) then break end
                         local contents=chest:FindFirstChild("Contents")
-                        if contents then
-                            for _,item in ipairs(contents:GetChildren()) do
-                                if not running or generation~=token then break end
-                                local amount=amountOf(item)
-                                if lastRequested[item]~=amount then
-                                    local inventoryBefore=inventoryAmount(item.Name)
-                                    local response=remote:InvokeServer({
-                                        chest=chest,
-                                        player_tracking_category="join_from_web",
-                                        amount=amount,
-                                        tool=item,
-                                        action="withdraw",
-                                    })
-                                    if response==false or (type(response)=="table" and response.success==false) then
-                                        error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
-                                    end
-                                    lastRequested[item]=amount
-                                    local changed=false
-                                    for _=1,20 do
-                                        if not running or generation~=token then break end
-                                        local remaining=contents:FindFirstChild(item.Name)
-                                        if item.Parent~=contents or not item.Parent
-                                            or (remaining and remaining:FindFirstChild("Amount")
-                                                and (tonumber(remaining.Amount.Value) or amount)<amount)
-                                            or inventoryAmount(item.Name)>inventoryBefore then
-                                            changed=true;break
+                        local didOpen=false
+                        local opened,openError=pcall(function()
+                            status:SetDesc("Opening chest "..chestIndex.." / "..found.."...")
+                            toggleRemote:InvokeServer({chest=chest,open=true})
+                            didOpen=true
+                            task.wait(0.15)
+                            if contents then
+                                for _,item in ipairs(contents:GetChildren()) do
+                                    if not running or generation~=token then break end
+                                    local amount=amountOf(item)
+                                    if lastRequested[item]~=amount then
+                                        local inventoryBefore=inventoryAmount(item.Name)
+                                        local response=remote:InvokeServer({
+                                            chest=chest,
+                                            player_tracking_category="join_from_web",
+                                            amount=amount,
+                                            tool=item,
+                                            action="withdraw",
+                                        })
+                                        if response==false or (type(response)=="table" and response.success==false) then
+                                            error("The server rejected the withdraw request for "..item.Name..": "..tostring(response),0)
                                         end
-                                        task.wait(0.1)
+                                        lastRequested[item]=amount
+                                        local changed=false
+                                        for _=1,20 do
+                                            if not running or generation~=token then break end
+                                            local remaining=contents:FindFirstChild(item.Name)
+                                            if item.Parent~=contents or not item.Parent
+                                                or (remaining and remaining:FindFirstChild("Amount")
+                                                    and (tonumber(remaining.Amount.Value) or amount)<amount)
+                                                or inventoryAmount(item.Name)>inventoryBefore then
+                                                changed=true;break
+                                            end
+                                            task.wait(0.1)
+                                        end
+                                        if changed then
+                                            total=total+1
+                                            lastResult="Confirmed "..item.Name.." × "..amount
+                                            status:SetDesc("Withdrawn "..total.." stack(s). Latest: "..lastResult)
+                                        else
+                                            lastResult="No visible change after requesting "..item.Name.." × "..amount
+                                            status:SetDesc(lastResult..". Check inventory space and chest permissions; request will not repeat automatically.")
+                                        end
+                                        task.wait(delaySeconds)
                                     end
-                                    if changed then
-                                        total=total+1
-                                        lastResult="Confirmed "..item.Name.." × "..amount
-                                        status:SetDesc("Withdrawn "..total.." stack(s). Latest: "..lastResult)
-                                    else
-                                        lastResult="No visible change after requesting "..item.Name.." × "..amount
-                                        status:SetDesc(lastResult..". Check inventory space and chest permissions; request will not repeat automatically.")
-                                    end
-                                    task.wait(delaySeconds)
                                 end
                             end
+                        end)
+                        local closed,closeError=true,nil
+                        if didOpen then
+                            closed,closeError=pcall(function() toggleRemote:InvokeServer({chest=chest,open=false}) end)
                         end
+                        if not opened then error(openError,0) end
+                        if not closed then error("Could not close chest after pickup: "..tostring(closeError),0) end
                     end
                     if not running or generation~=token then break end
                     if found==0 then
