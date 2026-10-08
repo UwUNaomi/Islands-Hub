@@ -1153,6 +1153,8 @@ local function installChestPickup()
     local status=Auto:AddParagraph({Title="Chest Pickup Status",Content="Off. Scans only chestLargeIndustrialIO on your own island."})
     local running,generation=false,0
     local delaySeconds=0.1
+    local travelSpeed=35
+    local activeTween
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
         Description="Withdraws stored items from chestLargeIndustrialIO chests on your own island.",
@@ -1162,6 +1164,38 @@ local function installChestPickup()
         Title="Delay Between Items (seconds)",Description="Short pauses between normal withdraw requests.",
         Default=0.1,Min=0.05,Max=1,Rounding=2,Callback=function(value) delaySeconds=value end,
     })
+    section:AddSlider("ChestPickupTravelSpeed",{
+        Title="Chest Travel Speed",Description="Tween speed in studs per second.",
+        Default=35,Min=10,Max=100,Rounding=0,Callback=function(value) travelSpeed=value end,
+    })
+    local function moveToChest(chest,number,total,token)
+        local character,humanoid,root=getCharacter()
+        assert(character,"Wait for your character before starting chest pickup.")
+        local part=chest:IsA("BasePart") and chest or chest:FindFirstChild("Root",true)
+        if not part or not part:IsA("BasePart") then part=chest:FindFirstChildWhichIsA("BasePart",true) end
+        assert(part,"Chest has no usable part: "..chest.Name)
+        local horizontal=Vector3.new(root.Position.X-part.Position.X,0,root.Position.Z-part.Position.Z)
+        if horizontal.Magnitude<0.1 then
+            horizontal=Vector3.new(-part.CFrame.LookVector.X,0,-part.CFrame.LookVector.Z)
+        end
+        if horizontal.Magnitude<0.1 then horizontal=Vector3.new(0,0,1) end
+        local destination=part.Position+Vector3.new(0,3,0)+horizontal.Unit*5
+        local target=CFrame.lookAt(destination,part.Position+Vector3.new(0,2,0))
+        local distance=(root.Position-destination).Magnitude
+        status:SetDesc("Moving to chest "..number.." / "..total.." ("..math.floor(distance).." studs)...")
+        if distance>2 then
+            activeTween=game:GetService("TweenService"):Create(root,
+                TweenInfo.new(distance/math.max(travelSpeed,1),Enum.EasingStyle.Linear),
+                {CFrame=target})
+            activeTween:Play()
+            local result=activeTween.Completed:Wait()
+            activeTween=nil
+            if not running or generation~=token or result~=Enum.PlaybackState.Completed then return false end
+        end
+        assert((root.Position-part.Position).Magnitude<=14,
+            "Tween ended outside chest range ("..math.floor((root.Position-part.Position).Magnitude).." studs).")
+        return true
+    end
     local function ownBlockFolder()
         local islands=workspace:FindFirstChild("Islands")
         if not islands then return nil end
@@ -1192,6 +1226,7 @@ local function installChestPickup()
         local token=generation
         running=enabled
         if not enabled then
+            if activeTween then activeTween:Cancel();activeTween=nil end
             status:SetDesc("Stopped. Any withdraw request already sent may still finish.")
             return
         end
@@ -1204,32 +1239,35 @@ local function installChestPickup()
                 while running and generation==token do
                     local blocks=ownBlockFolder()
                     assert(blocks,"Your island Blocks folder was not found.")
-                    local found=0
-                    for _,chest in ipairs(blocks:GetChildren()) do
+                    local chests={}
+                    for _,block in ipairs(blocks:GetChildren()) do
+                        if block.Name=="chestLargeIndustrialIO" and block:FindFirstChild("Contents") then
+                            table.insert(chests,block)
+                        end
+                    end
+                    local found=#chests
+                    for chestIndex,chest in ipairs(chests) do
                         if not running or generation~=token then break end
-                        if chest.Name=="chestLargeIndustrialIO" then
-                            local contents=chest:FindFirstChild("Contents")
-                            if contents then
-                                found=found+1
-                                chests=math.max(chests,found)
-                                for _,item in ipairs(contents:GetChildren()) do
-                                    if not running or generation~=token then break end
-                                    local amount=amountOf(item)
-                                    if lastRequested[item]~=amount then
-                                        local response=remote:InvokeServer({
-                                            chest=chest,
-                                            player_tracking_category="join_from_web",
-                                            amount=amount,
-                                            tool=item,
-                                            action="withdraw",
-                                        })
-                                        assert(type(response)=="table" and response.success==true,
-                                            "Withdraw was not confirmed for "..item.Name..": "..tostring(response))
-                                        lastRequested[item]=amount
-                                        total=total+1
-                                        status:SetDesc("Withdrawn "..total.." item stacks from "..chests.." large industrial chest(es). Latest: "..item.Name.." × "..amount)
-                                        task.wait(delaySeconds)
-                                    end
+                        if not moveToChest(chest,chestIndex,found,token) then break end
+                        local contents=chest:FindFirstChild("Contents")
+                        if contents then
+                            for _,item in ipairs(contents:GetChildren()) do
+                                if not running or generation~=token then break end
+                                local amount=amountOf(item)
+                                if lastRequested[item]~=amount then
+                                    local response=remote:InvokeServer({
+                                        chest=chest,
+                                        player_tracking_category="join_from_web",
+                                        amount=amount,
+                                        tool=item,
+                                        action="withdraw",
+                                    })
+                                    assert(type(response)=="table" and response.success==true,
+                                        "Withdraw was not confirmed for "..item.Name..": "..tostring(response))
+                                    lastRequested[item]=amount
+                                    total=total+1
+                                    status:SetDesc("Chest "..chestIndex.." / "..found.." | withdrew "..item.Name.." × "..amount.." | "..total.." stack(s) total.")
+                                    task.wait(delaySeconds)
                                 end
                             end
                         end
@@ -1244,6 +1282,7 @@ local function installChestPickup()
                 end
             end,debug.traceback)
             if not ok and generation==token then
+                if activeTween then activeTween:Cancel();activeTween=nil end
                 running=false
                 toggle:SetValue(false)
                 status:SetDesc("Chest pickup stopped: "..tostring(err))
@@ -1253,6 +1292,7 @@ local function installChestPickup()
     stopChestPickup=function()
         generation=generation+1
         running=false
+        if activeTween then activeTween:Cancel();activeTween=nil end
     end
 end
 installChestPickup()
