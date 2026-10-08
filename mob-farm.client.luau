@@ -1146,7 +1146,7 @@ Settings:AddButton({
 
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
-    local build = { speed = 5, teleport = true, moveNear = false, autoReach = true, useRadius = false, radius = 85,
+    local build = { speed = 5, travelSpeed = 25, teleport = true, moveNear = false, autoReach = true, useRadius = false, radius = 85,
         retryPasses = 4, showHUD = true, noclip = true, paused = false, saveName = "mybuild", collision = false, records = {},
         version = 0, busy = false, mode = nil, file = "Template", folder = "RoSnipe/Schematica", loadNearPlayer = true, events = {}, actions = {} }
     local function trace(kind, message)
@@ -1216,7 +1216,7 @@ local function installAutoBuild()
             pendingRequest=pendingRequest and not pendingRequest.done or false,
             placeRemote=placeRemote and placeRemote:GetFullName() or "unresolved", hashResolved=placeKey~=nil and placeHash~=nil,
             handleMode=build.handleMode or "none", handlesVisible=handles.Visible, handlesAdornee=handles.Adornee and handles.Adornee:GetFullName() or "none",
-            minimized=Window.Minimized, speed=build.speed, teleport=build.teleport, autoReach=build.autoReach, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
+            minimized=Window.Minimized, speed=build.speed, travelSpeed=build.travelSpeed, teleport=build.teleport, autoReach=build.autoReach, previewCollision=build.collision, loadNearPlayer=build.loadNearPlayer,
             actions=actions, events=events,
         }
     end
@@ -1789,14 +1789,15 @@ local function installAutoBuild()
                 -- Recheck reach after a pause, immediately before the actual call.
                 if beforeSend and not beforeSend() then request.cancelled=true;return end
                 if not waitReady() then request.cancelled=true;return end
+                request.sentAt=os.clock()
                 return remote:InvokeServer(payload)
             end)
             request.done = true
         end)
-        local deadline = os.clock()+8
         while not request.done and current() do
-            if build.paused then deadline=os.clock()+8 end
-            if os.clock()>=deadline then break end
+            -- Travel can take longer than a remote reply. Start the network
+            -- timeout only when InvokeServer actually starts.
+            if request.sentAt and os.clock()-request.sentAt>=8 then break end
             task.wait(0.05)
         end
         if not current() or request.cancelled then return false end
@@ -1897,33 +1898,62 @@ local function installAutoBuild()
             elseif frozen then frozen:Destroy();frozen=nil end
         end
         local function ensureReach(record)
-            -- A velocity-only hover can drift away from an elevated target.
-            -- Hold a position and verify again after replication/physics settles.
-            for attempt=1,3 do
-                if not waitReady() then return false end
-                local distance=(root.Position-record.cf.Position).Magnitude
-                if distance<=30 and not (canMove() and (build.moveNear or distance>24)) then
-                    if canMove() then
-                        syncMovement()
-                        holdPosition=root.Position
-                        if frozen then frozen.Position=holdPosition end
-                    end
-                    return true
+            if not waitReady() then return false end
+            local distance=(root.Position-record.cf.Position).Magnitude
+            if distance<=24 or (not canMove() and distance<=30) then
+                if canMove() then
+                    syncMovement()
+                    holdPosition=root.Position
+                    if frozen then frozen.Position=holdPosition end
                 end
-                assert(canMove(),"Target out of reach ("..math.floor(distance).." studs). Enable Auto Reach Floating Blocks or Move To Build Position.")
+                if not build.moveNear then return true end
+            end
+            assert(canMove(),"Target out of reach ("..math.floor(distance).." studs). Enable Auto Reach Floating Blocks or Move To Build Position.")
+            local destination=record.cf.Position+Vector3.new(0,10,0)
+            local activeTime,stalledTime,lastStatus=0,0,-1
+            local best=(root.Position-destination).Magnitude
+            local travelLimit=math.max(30,best/math.max(build.travelSpeed,5)*3+10)
+            trace("build movement","Travel to "..record.name.."; distance "..math.floor(distance))
+            -- Small steps avoid a single long jump to a distant schematic cell.
+            -- Progress uses observed positions after each physics step.
+            while activeTime<travelLimit do
+                if not waitReady() then return false end
+                assert(canMove(),"Build movement disabled while travelling. Enable Auto Reach Floating Blocks or Move To Build Position.")
                 syncMovement()
-                holdPosition=record.cf.Position+Vector3.new(0,10,0)
+                local delta=destination-root.Position
+                local remaining=delta.Magnitude
+                if remaining<=2 then
+                    holdPosition=root.Position
+                    if frozen then frozen.Position=holdPosition end
+                    task.wait(0.15)
+                    if not waitReady() then return false end
+                    if (root.Position-record.cf.Position).Magnitude<=24 then return true end
+                end
+                delta=destination-root.Position
+                remaining=delta.Magnitude
+                local step=math.min(remaining,math.clamp(build.travelSpeed,5,60)*0.05)
+                holdPosition=remaining>0.001 and root.Position+delta.Unit*step or root.Position
                 if frozen then frozen.Position=holdPosition end
                 root.AssemblyLinearVelocity=Vector3.zero
                 root.CFrame=CFrame.new(holdPosition)
                 moved=true
-                trace("build movement","Approach "..record.name.."; attempt "..attempt.."; distance "..math.floor(distance))
-                task.wait(0.2)
+                if activeTime-lastStatus>=1 then
+                    status("Moving to "..record.name.." | "..math.floor((root.Position-record.cf.Position).Magnitude).." studs away")
+                    lastStatus=activeTime
+                end
+                local elapsed=task.wait(0.05)
+                elapsed=math.clamp(tonumber(elapsed) or 0.05,0.01,0.25)
+                activeTime=activeTime+elapsed
                 if not waitReady() then return false end
-                if (root.Position-record.cf.Position).Magnitude<=30 then return true end
+                local observed=(root.Position-destination).Magnitude
+                if observed<best-0.25 then best=observed;stalledTime=0
+                else stalledTime=stalledTime+elapsed end
+                if stalledTime>=5 then
+                    error("Build movement blocked or moved back for 5 seconds; "..math.floor((root.Position-record.cf.Position).Magnitude)
+                        .." studs from "..record.name..". Enable Auto Noclip While Building and check for another movement script. No placement request sent for this block.",0)
+                end
             end
-            error("Could not stay within placement reach of "..record.name.." ("..math.floor((root.Position-record.cf.Position).Magnitude)
-                .." studs). The character may be getting moved back; no request was sent for this block.",0)
+            error("Build travel timed out before reaching "..record.name..". No placement request sent for this block.",0)
         end
         local function arrange(queue)
             local center=root.Position
@@ -2137,6 +2167,7 @@ local function installAutoBuild()
     end
     toggle(settings,"BuildMoveNear","Move Near Block Before Placing","Move beside each block before its placement request.",false,function(v) build.moveNear=v end)
     toggle(settings,"BuildAutoReach","Auto Reach Floating Blocks","Automatically move within reach and hover for elevated placements, even with Move To Build Position off.",true,function(v) build.autoReach=v end)
+    settings:AddSlider("BuildTravelSpeed",{Title="Build Travel Speed",Description="Gradual movement in studs per second.",Default=25,Min=5,Max=60,Rounding=0,Callback=function(v) build.travelSpeed=v end})
     local controls=AutoBuild:AddSection("AUTOBUILD")
     toggle(controls,"BuildTeleport","Move To Build Position","Moves within reach as the build progresses.",true,function(v) build.teleport=v end)
     toggle(controls,"BuildUseRadius","Use Build Radius","Prioritizes blocks inside your radius first; remaining blocks follow.",false,function(v) build.useRadius=v end)
