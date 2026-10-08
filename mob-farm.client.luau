@@ -1157,6 +1157,7 @@ local function installChestPickup()
     local nearbyOnly=true
     local nearbyRange=12
     local activeTween
+    local chestHover
     local toggle=section:AddToggle("ChestPickupEnabled",{
         Title="Auto Empty Large Industrial Chests",
         Description="Uses the original ChestAura pattern: request each stored stack in one pass.",
@@ -1167,11 +1168,11 @@ local function installChestPickup()
         Default=0,Min=0,Max=1,Rounding=2,Callback=function(value) delaySeconds=tonumber(value) or 0 end,
     })
     section:AddSlider("ChestPickupTravelSpeed",{
-        Title="Chest Travel Speed",Description="Tween speed in studs per second.",
+        Title="Chest Flight Speed",Description="Flies above the route, then hovers beside each chest.",
         Default=35,Min=10,Max=100,Rounding=0,Callback=function(value) travelSpeed=tonumber(value) or 35 end,
     })
     section:AddToggle("ChestPickupNearbyOnly",{
-        Title="Only Chests in Range",Description="Sweep nearby chests without moving; keep the range within normal chest reach.",
+        Title="Only Chests in Range",Description="Turn off to fly to farther chests while holding a hover beside each one.",
         Default=true,Callback=function(value) nearbyOnly=value end,
     })
     section:AddSlider("ChestPickupRange",{
@@ -1182,6 +1183,21 @@ local function installChestPickup()
         local part=chest:IsA("BasePart") and chest or chest:FindFirstChild("Root",true)
         if not part or not part:IsA("BasePart") then part=chest:FindFirstChildWhichIsA("BasePart",true) end
         return part
+    end
+    local function releaseChestHover()
+        if chestHover then chestHover:Destroy();chestHover=nil end
+    end
+    local function ensureChestHover(root)
+        if chestHover and chestHover.Parent~=root then releaseChestHover() end
+        if not chestHover then
+            chestHover=Instance.new("BodyPosition")
+            chestHover.Name="RoSnipeChestHover"
+            chestHover.MaxForce=Vector3.new(1e9,1e9,1e9)
+            chestHover.P,chestHover.D=10000,1000
+            chestHover.Position=root.Position
+            chestHover.Parent=root
+        end
+        return chestHover
     end
     local function moveToChest(chest,number,total,token)
         local character,humanoid,root=getCharacter()
@@ -1194,20 +1210,40 @@ local function installChestPickup()
         end
         if horizontal.Magnitude<0.1 then horizontal=Vector3.new(0,0,1) end
         local destination=part.Position+Vector3.new(0,3,0)+horizontal.Unit*5
-        local target=CFrame.lookAt(destination,part.Position+Vector3.new(0,2,0))
-        local distance=(root.Position-destination).Magnitude
+        local hover=ensureChestHover(root)
+        local startPosition=root.Position
+        local safeY=math.max(startPosition.Y,part.Position.Y+10)
+        local waypoints={
+            Vector3.new(startPosition.X,safeY,startPosition.Z),
+            Vector3.new(destination.X,safeY,destination.Z),
+            destination,
+        }
+        local distance=(startPosition-destination).Magnitude
         status:SetDesc("Moving to chest "..number.." / "..total.." ("..math.floor(distance).." studs)...")
-        if distance>2 then
-            activeTween=game:GetService("TweenService"):Create(root,
-                TweenInfo.new(distance/math.max(travelSpeed,1),Enum.EasingStyle.Linear),
-                {CFrame=target})
-            activeTween:Play()
-            local result=activeTween.Completed:Wait()
-            activeTween=nil
-            if not running or generation~=token or result~=Enum.PlaybackState.Completed then return false end
+        for _,point in ipairs(waypoints) do
+            local leg=(hover.Position-point).Magnitude
+            if leg>1 then
+                activeTween=game:GetService("TweenService"):Create(hover,
+                    TweenInfo.new(leg/math.max(travelSpeed,1),Enum.EasingStyle.Linear),
+                    {Position=point})
+                activeTween:Play()
+                local result=activeTween.Completed:Wait()
+                activeTween=nil
+                if not running or generation~=token or result~=Enum.PlaybackState.Completed then
+                    -- Keep the BodyPosition at its current goal if cancelled so the character
+                    -- does not drop while the user stops or changes the chest scan.
+                    if root.Parent then hover.Position=root.Position end
+                    return false
+                end
+            end
+        end
+        for _=1,30 do
+            if not running or generation~=token then hover.Position=root.Position;return false end
+            if (root.Position-part.Position).Magnitude<=14 then break end
+            task.wait(0.1)
         end
         assert((root.Position-part.Position).Magnitude<=14,
-            "Tween ended outside chest range ("..math.floor((root.Position-part.Position).Magnitude).." studs).")
+            "Flight ended outside chest range ("..math.floor((root.Position-part.Position).Magnitude).." studs).")
         return true
     end
     local function ownBlockFolder()
@@ -1365,10 +1401,11 @@ local function installChestPickup()
             end
         end)
     end)
-    stopChestPickup=function()
+    stopChestPickup=function(releaseHover)
         generation=generation+1
         running=false
         if activeTween then activeTween:Cancel();activeTween=nil end
+        if releaseHover then releaseChestHover() end
     end
 end
 installChestPickup()
@@ -3166,7 +3203,7 @@ installBossFarm()
 
 local function shutdown()
     if not state.running then return end
-    if stopChestPickup then stopChestPickup() end
+    if stopChestPickup then stopChestPickup(true) end
     if stopBossFarm then stopBossFarm() end
     if stopFarming then stopFarming() end
     state.running = false
