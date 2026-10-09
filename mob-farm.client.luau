@@ -900,12 +900,43 @@ MobSection:AddButton({
                 local equipped = character and character:FindFirstChildOfClass("Tool")
                 table.insert(lines, "Selected weapon=" .. tostring(state.weapon)
                     .. " Equipped weapon=" .. tostring(equipped and equipped.Name or "none"))
+                if not equipped then
+                    table.insert(lines, "WARNING: No tool is equipped. Equip the selected weapon and hit a slime, then rerun this diagnostic.")
+                end
                 local net = netManaged()
                 local remotes = net and net:GetChildren() or {}
                 table.insert(lines, "NetManaged remotes=" .. #remotes)
                 assert(type(getgc) == "function" and type(info) == "function" and type(constants) == "function",
                     "Missing getgc/getinfo/getconstants support.")
 
+                local function countFunctions(items)
+                    if type(items) ~= "table" then return 0, 0 end
+                    local total, functions = 0, 0
+                    for _, item in pairs(items) do
+                        total = total + 1
+                        if type(item) == "function" then functions = functions + 1 end
+                    end
+                    return total, functions
+                end
+                local gcTrueOk, gcTrueItems = pcall(getgc, true)
+                local trueTotal, trueFunctions = 0, 0
+                if gcTrueOk then trueTotal, trueFunctions = countFunctions(gcTrueItems) end
+                local gcItems, gcMode = gcTrueItems, "getgc(true)"
+                if not gcTrueOk or trueFunctions == 0 then
+                    local gcDefaultOk, gcDefaultItems = pcall(getgc)
+                    local defaultTotal, defaultFunctions = 0, 0
+                    if gcDefaultOk then defaultTotal, defaultFunctions = countFunctions(gcDefaultItems) end
+                    table.insert(lines, "getgc(true): ok=" .. tostring(gcTrueOk) .. " objects=" .. trueTotal
+                        .. " functions=" .. trueFunctions .. "; getgc(): ok=" .. tostring(gcDefaultOk)
+                        .. " objects=" .. defaultTotal .. " functions=" .. defaultFunctions
+                        .. (gcTrueOk and "" or "; getgc(true) error=" .. tostring(gcTrueItems))
+                        .. (gcDefaultOk and "" or "; getgc() error=" .. tostring(gcDefaultItems)))
+                    if gcDefaultOk and (not gcTrueOk or defaultFunctions > trueFunctions) then
+                        gcItems, gcMode = gcDefaultItems, "getgc() fallback"
+                    end
+                else
+                    table.insert(lines, "getgc(true): objects=" .. trueTotal .. " functions=" .. trueFunctions)
+                end
                 local executorCheck = isexecutorclosure or checkclosure or (syn and syn.isexecutorclosure)
                 local function scalar(value)
                     if type(value) == "string" then
@@ -917,7 +948,7 @@ MobSection:AddButton({
                 end
                 local scanned, infoErrors, constantErrors, excluded, candidateCount = 0, 0, 0, 0, 0
                 local sourceCounts, firstInfoError, firstConstantError = {}, nil, nil
-                for _, fn in pairs(getgc(true)) do
+                for _, fn in pairs(gcItems or {}) do
                     if type(fn) == "function" then
                         scanned = scanned + 1
                         local infoOk, details = pcall(info, fn)
@@ -993,7 +1024,7 @@ MobSection:AddButton({
                         if scanned % 200 == 0 then task.wait() end
                     end
                 end
-                table.insert(lines, "Functions scanned=" .. scanned .. " candidates=" .. candidateCount
+                table.insert(lines, "GC source=" .. gcMode .. " | Functions scanned=" .. scanned .. " candidates=" .. candidateCount
                     .. " executor closures excluded=" .. excluded .. " getinfo errors=" .. infoErrors
                     .. " getconstants errors=" .. constantErrors)
                 if firstInfoError then table.insert(lines, "First getinfo error=" .. firstInfoError) end
