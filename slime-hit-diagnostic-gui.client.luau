@@ -127,22 +127,30 @@ local function runDiagnostic()
             local gcTrueOk, gcTrueItems = pcall(getgc, true)
             local trueTotal, trueFunctions = 0, 0
             if gcTrueOk then trueTotal, trueFunctions = countFunctions(gcTrueItems) end
-            local gcItems, gcMode = gcTrueItems, "getgc(true)"
-            if not gcTrueOk or trueFunctions == 0 then
-                local gcDefaultOk, gcDefaultItems = pcall(getgc)
-                local defaultTotal, defaultFunctions = 0, 0
-                if gcDefaultOk then defaultTotal, defaultFunctions = countFunctions(gcDefaultItems) end
-                append("getgc(true): ok=" .. tostring(gcTrueOk) .. " objects=" .. trueTotal .. " functions=" .. trueFunctions
-                    .. "; getgc(): ok=" .. tostring(gcDefaultOk) .. " objects=" .. defaultTotal .. " functions=" .. defaultFunctions
-                    .. (gcTrueOk and "" or "; getgc(true) error=" .. tostring(gcTrueItems))
-                    .. (gcDefaultOk and "" or "; getgc() error=" .. tostring(gcDefaultItems)))
-                if gcDefaultOk and (not gcTrueOk or defaultFunctions > trueFunctions) then
-                    gcItems, gcMode = gcDefaultItems, "getgc() fallback"
-                end
-            else
-                append("getgc(true): objects=" .. trueTotal .. " functions=" .. trueFunctions)
+            local gcFalseOk, gcFalseItems = pcall(getgc, false)
+            local falseTotal, falseFunctions = 0, 0
+            if gcFalseOk then falseTotal, falseFunctions = countFunctions(gcFalseItems) end
+            local gcDefaultOk, gcDefaultItems = pcall(getgc)
+            local defaultTotal, defaultFunctions = 0, 0
+            if gcDefaultOk then defaultTotal, defaultFunctions = countFunctions(gcDefaultItems) end
+            append("getgc(true): ok=" .. tostring(gcTrueOk) .. " objects=" .. trueTotal .. " functions=" .. trueFunctions
+                .. (gcTrueOk and "" or " error=" .. tostring(gcTrueItems)))
+            append("getgc(false): ok=" .. tostring(gcFalseOk) .. " objects=" .. falseTotal .. " functions=" .. falseFunctions
+                .. (gcFalseOk and "" or " error=" .. tostring(gcFalseItems)))
+            append("getgc(): ok=" .. tostring(gcDefaultOk) .. " objects=" .. defaultTotal .. " functions=" .. defaultFunctions
+                .. (gcDefaultOk and "" or " error=" .. tostring(gcDefaultItems)))
+            -- Prefer the function-only form when available; otherwise scan the
+            -- successful result with the largest function count for diagnostics.
+            local gcItems, gcMode, bestFunctions = {}, "none", 0
+            if gcFalseOk and falseFunctions > bestFunctions then
+                gcItems, gcMode, bestFunctions = gcFalseItems, "getgc(false)", falseFunctions
             end
-            if type(gcItems) ~= "table" then gcItems = {} end
+            if gcTrueOk and trueFunctions > bestFunctions then
+                gcItems, gcMode, bestFunctions = gcTrueItems, "getgc(true)", trueFunctions
+            end
+            if gcDefaultOk and defaultFunctions > bestFunctions then
+                gcItems, gcMode, bestFunctions = gcDefaultItems, "getgc()", defaultFunctions
+            end
 
             local executorCheck = isexecutorclosure or checkclosure or (syn and syn.isexecutorclosure)
             local ownFunctions = { [append] = true, [make] = true, [button] = true, [setReport] = true, [runDiagnostic] = true }
