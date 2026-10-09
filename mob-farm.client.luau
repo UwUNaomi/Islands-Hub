@@ -872,6 +872,159 @@ auraToggle:OnChanged(function(value)
     setAuraStatus(value and ("Starting; equipping " .. (state.weapon or "selected weapon") .. "...") or "Off")
     if value and not combatRemote then task.spawn(refreshCombat) end
 end)
+local MobDiagnosticStatus = MobSection:AddParagraph({
+    Title = "Slime Hit Diagnostic",
+    Content = "Equip the weapon, hit a slime manually once, then run this read-only diagnostic.",
+})
+local diagnosticRunning = false
+MobSection:AddButton({
+    Title = "Run Slime Hit Diagnostic",
+    Callback = function()
+        if diagnosticRunning then return end
+        diagnosticRunning = true
+        MobDiagnosticStatus:SetDesc("Scanning combat functions. This can take a few seconds...")
+        task.spawn(function()
+            local ok, err = pcall(function()
+                local info = getinfo or (debug and debug.getinfo)
+                local constants = getconstants or (debug and debug.getconstants)
+                local upvalues = getupvalues or (debug and debug.getupvalues)
+                local protos = getprotos or (debug and debug.getprotos)
+                local lines = {
+                    "RoSnipe slime hit diagnostic v1",
+                    "PlaceId=" .. tostring(game.PlaceId) .. " PlaceVersion=" .. tostring(game.PlaceVersion),
+                    "getgc=" .. type(getgc) .. " getinfo=" .. type(info)
+                        .. " getconstants=" .. type(constants) .. " getupvalues=" .. type(upvalues)
+                        .. " getprotos=" .. type(protos) .. " getfenv=" .. type(getfenv),
+                }
+                local character = LocalPlayer.Character
+                local equipped = character and character:FindFirstChildOfClass("Tool")
+                table.insert(lines, "Selected weapon=" .. tostring(state.weapon)
+                    .. " Equipped weapon=" .. tostring(equipped and equipped.Name or "none"))
+                local net = netManaged()
+                local remotes = net and net:GetChildren() or {}
+                table.insert(lines, "NetManaged remotes=" .. #remotes)
+                assert(type(getgc) == "function" and type(info) == "function" and type(constants) == "function",
+                    "Missing getgc/getinfo/getconstants support.")
+
+                local executorCheck = isexecutorclosure or checkclosure or (syn and syn.isexecutorclosure)
+                local function scalar(value)
+                    if type(value) == "string" then
+                        if #value > 1000 then return string.format("%q [truncated]", value:sub(1, 1000)) end
+                        return string.format("%q", value)
+                    end
+                    if type(value) == "number" or type(value) == "boolean" or value == nil then return tostring(value) end
+                    return "<" .. type(value) .. ">"
+                end
+                local scanned, infoErrors, constantErrors, excluded, candidateCount = 0, 0, 0, 0, 0
+                local sourceCounts, firstInfoError, firstConstantError = {}, nil, nil
+                for _, fn in pairs(getgc(true)) do
+                    if type(fn) == "function" then
+                        scanned = scanned + 1
+                        local infoOk, details = pcall(info, fn)
+                        local infoError = not infoOk and tostring(details) or nil
+                        details = infoOk and type(details) == "table" and details or {}
+                        local source = tostring(details.source or details.short_src or "unknown")
+                        sourceCounts[source] = (sourceCounts[source] or 0) + 1
+                        if not infoOk then infoErrors = infoErrors + 1; firstInfoError = firstInfoError or infoError end
+                        local isExecutor = false
+                        if type(executorCheck) == "function" then
+                            local checked, result = pcall(executorCheck, fn)
+                            isExecutor = checked and result == true
+                        end
+                        if isExecutor then
+                            excluded = excluded + 1
+                        else
+                            local constantsOk, values = pcall(constants, fn)
+                            if not constantsOk or type(values) ~= "table" then
+                                constantErrors = constantErrors + 1
+                                firstConstantError = firstConstantError or tostring(values)
+                            else
+                                local hasHitUnit = table.find(values, "hitUnit") ~= nil
+                                local named = string.lower(tostring(details.name or "")) == "attempthit"
+                                local selectedSource = equipped and string.find(source, "." .. equipped.Name .. ".", 1, true) ~= nil
+                                local activeScript = false
+                                if type(getfenv) == "function" and equipped then
+                                    local envOk, belongs = pcall(function()
+                                        local env = getfenv(fn)
+                                        local scriptObject = type(env) == "table" and rawget(env, "script")
+                                        return typeof(scriptObject) == "Instance" and scriptObject:IsDescendantOf(equipped)
+                                    end)
+                                    activeScript = envOk and belongs == true
+                                end
+                                if hasHitUnit or named or selectedSource or activeScript then
+                                    candidateCount = candidateCount + 1
+                                    if candidateCount <= 40 then
+                                        table.insert(lines, "Candidate " .. candidateCount .. ": name="
+                                            .. tostring(details.name or "unnamed") .. " source=" .. source
+                                            .. " activeScript=" .. tostring(activeScript)
+                                            .. " selectedSource=" .. tostring(selectedSource)
+                                            .. " hitUnit=" .. tostring(hasHitUnit))
+                                        for index, value in pairs(values) do
+                                            table.insert(lines, "  constant[" .. tostring(index) .. "]=" .. scalar(value))
+                                        end
+                                        if type(upvalues) == "function" then
+                                            local upsOk, ups = pcall(upvalues, fn)
+                                            if upsOk and type(ups) == "table" then
+                                                for index, value in pairs(ups) do
+                                                    table.insert(lines, "  upvalue[" .. tostring(index) .. "]=" .. scalar(value))
+                                                end
+                                            else
+                                                table.insert(lines, "  getupvalues error=" .. tostring(ups))
+                                            end
+                                        end
+                                        for _, value in pairs(values) do
+                                            if type(value) == "string" then
+                                                for _, remote in ipairs(remotes) do
+                                                    if remote:IsA("RemoteEvent") and (remote.Name == value
+                                                        or remote.Name:sub(-#("/" .. value)) == "/" .. value) then
+                                                        table.insert(lines, "  matching RemoteEvent=" .. remote:GetFullName())
+                                                    end
+                                                end
+                                            end
+                                        end
+                                        if type(protos) == "function" and named then
+                                            local protoOk, children = pcall(protos, fn)
+                                            table.insert(lines, "  getprotos=" .. (protoOk and type(children) == "table" and #children or tostring(children)))
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                        if scanned % 200 == 0 then task.wait() end
+                    end
+                end
+                table.insert(lines, "Functions scanned=" .. scanned .. " candidates=" .. candidateCount
+                    .. " executor closures excluded=" .. excluded .. " getinfo errors=" .. infoErrors
+                    .. " getconstants errors=" .. constantErrors)
+                if firstInfoError then table.insert(lines, "First getinfo error=" .. firstInfoError) end
+                if firstConstantError then table.insert(lines, "First getconstants error=" .. firstConstantError) end
+                local sources = {}
+                for source, count in pairs(sourceCounts) do table.insert(sources, { source = source, count = count }) end
+                table.sort(sources, function(a, b) return a.count > b.count end)
+                for index = 1, math.min(5, #sources) do
+                    table.insert(lines, "Common source " .. index .. ": " .. sources[index].source .. " (" .. sources[index].count .. ")")
+                end
+                if candidateCount > 40 then table.insert(lines, "[remaining candidates omitted]") end
+                local report = table.concat(lines, "\n")
+                local saved, saveError = false, "writefile unavailable"
+                if type(writefile) == "function" then saved, saveError = pcall(writefile, "islands-mob-hit-diagnostic.txt", report) end
+                for _, line in ipairs(lines) do print(line) end
+                if saved then
+                    MobDiagnosticStatus:SetDesc("Saved islands-mob-hit-diagnostic.txt to executor workspace. "
+                        .. candidateCount .. " candidates; " .. scanned .. " functions scanned. Share that file.")
+                else
+                    MobDiagnosticStatus:SetDesc("Printed diagnostic; file save failed: " .. tostring(saveError)
+                        .. ". Check executor console and share the output.")
+                end
+            end)
+            diagnosticRunning = false
+            if not ok then
+                MobDiagnosticStatus:SetDesc("Diagnostic error: " .. tostring(err))
+                warn("[Slime Hit Diagnostic] " .. tostring(err))
+            end
+        end)
+    end,
+})
 MobSection:AddSlider("SlimeAuraRange", {
     Title = "Slime Aura Range", Default = 20, Min = 1, Max = 50, Rounding = 0,
     Callback = function(value) state.auraRange = value end,
