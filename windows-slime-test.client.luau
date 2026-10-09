@@ -8,9 +8,41 @@ local UIS = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local running, closed = false, false
 local attempts, observedDamage, lastError = 0, 0, nil
-local healthSamples, log = {}, { "RoSnipe Windows Tool Activate test v2" }
+local healthSamples, log = {}, { "RoSnipe Windows Tool Activate test v3" }
 local cameraSnapshot, activeTool
+local watchedTool, watchedAnimator, activatedConnection, animationConnection
+local activationEvents, animationEvents, lastAnimation = 0, 0, "none"
+local activationWindowUntil, lastTarget, lastDistance = 0, "none", nil
 local INTERVAL, RANGE = 0.65, 12
+
+local function clearObservers()
+    if activatedConnection then activatedConnection:Disconnect(); activatedConnection = nil end
+    if animationConnection then animationConnection:Disconnect(); animationConnection = nil end
+    watchedTool, watchedAnimator = nil, nil
+end
+local function observeTool(tool)
+    if watchedTool ~= tool then
+        if activatedConnection then activatedConnection:Disconnect() end
+        watchedTool = tool
+        activatedConnection = tool.Activated:Connect(function()
+            if running and os.clock() <= activationWindowUntil then activationEvents = activationEvents + 1 end
+        end)
+    end
+    local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if watchedAnimator ~= animator then
+        if animationConnection then animationConnection:Disconnect(); animationConnection = nil end
+        watchedAnimator = animator
+        if animator then
+            animationConnection = animator.AnimationPlayed:Connect(function(track)
+                if running and os.clock() <= activationWindowUntil then
+                    animationEvents = animationEvents + 1
+                    lastAnimation = track.Animation and track.Animation.AnimationId or "unknown"
+                end
+            end)
+        end
+    end
+end
 
 local function create(class, properties, parent)
     local instance = Instance.new(class)
@@ -112,8 +144,10 @@ local function attack(mob)
     assert(tool, "No equipped Tool")
     assert(tool.Enabled, "Equipped Tool is disabled")
     assert(not tool.RequiresHandle or tool:FindFirstChild("Handle"), "Tool requires a missing Handle")
+    observeTool(tool)
     aim(mob)
     activeTool = tool
+    activationWindowUntil = os.clock() + 0.6
     tool:Activate()
     task.wait(0.06)
     local released, err = release()
@@ -123,6 +157,11 @@ end
 local function report()
     return table.concat(log, "\n") .. "\nMethod=Tool Activate Attempts=" .. attempts
         .. " Observed health decreases=" .. observedDamage .. " Last error=" .. tostring(lastError or "none")
+        .. "\nEquipped weapon=" .. tostring(watchedTool and watchedTool.Name or "none")
+        .. " Activation events=" .. activationEvents .. " Animation events in activation windows=" .. animationEvents
+        .. " Last animation=" .. tostring(lastAnimation)
+        .. "\nTarget=" .. lastTarget .. " Distance=" .. tostring(lastDistance or "unknown")
+        .. "\nAnimation events can include movement/idle animations; they are not proof of a sword swing or damage."
 end
 create("TextLabel", {
     Position = UDim2.fromOffset(12, 144), Size = UDim2.fromOffset(321, 34),
@@ -149,12 +188,13 @@ button("Close", 12, 232, 321, function() stop(); closed = true; screen:Destroy()
 local inputConnection = UIS.InputBegan:Connect(function(input, processed)
     if not processed and input.KeyCode == Enum.KeyCode.RightShift then panel.Visible = not panel.Visible end
 end)
-screen.Destroying:Connect(function() stop(); closed = true; inputConnection:Disconnect() end)
+screen.Destroying:Connect(function() stop(); closed = true; clearObservers(); inputConnection:Disconnect() end)
 task.spawn(function()
     while not closed do
         if running then
             local mob, distance = getTarget()
             if mob then
+                lastTarget, lastDistance = mob.Name, distance
                 local humanoid = mob:FindFirstChildOfClass("Humanoid")
                 local previous = healthSamples[mob]
                 if previous and humanoid.Health < previous then observedDamage = observedDamage + 1 end
@@ -167,7 +207,7 @@ task.spawn(function()
                 elseif running and not closed then
                     status.Text = "Tool Activate | " .. mob.Name .. " | " .. math.floor(distance) .. " studs\n"
                         .. "Attempts: " .. attempts .. " | Health decreases observed: " .. observedDamage
-                        .. "\nWatch slime health to confirm damage. Right Shift hides this panel."
+                        .. "\nActivation events: " .. activationEvents .. " | Animation events: " .. animationEvents
                 end
             else
                 restoreCamera()
