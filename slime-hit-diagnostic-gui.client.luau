@@ -58,12 +58,13 @@ local output = make("ScrollingFrame", {
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
 }, window)
 make("UICorner", { CornerRadius = UDim.new(0, 7) }, output)
-local reportLabel = make("TextLabel", {
+local reportLabel = make("TextBox", {
     Name = "ReportText", Size = UDim2.new(1, -16, 0, 0), Position = UDim2.fromOffset(8, 8),
     BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code,
     Text = "Click Run Diagnostic to scan. The report is also saved to your executor workspace.",
     TextSize = 12, TextColor3 = Color3.fromRGB(45, 40, 45), TextWrapped = true,
     TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+    ClearTextOnFocus = false, TextEditable = false, MultiLine = true,
 }, output)
 
 local function button(label, x, width, callback)
@@ -97,7 +98,7 @@ local function runDiagnostic()
             local constants = getconstants or (debug and debug.getconstants)
             local upvalues = getupvalues or (debug and debug.getupvalues)
             local protos = getprotos or (debug and debug.getprotos)
-            append("RoSnipe standalone slime-hit diagnostic v1")
+            append("RoSnipe standalone slime-hit diagnostic v2")
             append("PlaceId=" .. tostring(game.PlaceId) .. " PlaceVersion=" .. tostring(game.PlaceVersion))
             append("getgc=" .. type(getgc) .. " getinfo=" .. type(info) .. " getconstants=" .. type(constants)
                 .. " getupvalues=" .. type(upvalues) .. " getprotos=" .. type(protos) .. " getfenv=" .. type(getfenv))
@@ -112,8 +113,112 @@ local function runDiagnostic()
             end
             local remotes = net and net:GetChildren() or {}
             append("NetManaged remotes=" .. #remotes)
-            assert(type(getgc) == "function" and type(info) == "function" and type(constants) == "function",
-                "Missing getgc/getinfo/getconstants support.")
+            -- Presence alone is not proof that an executor implements an API.
+            local probeUpvalue = { marker = "RoSnipe probe upvalue" }
+            local function probe()
+                local marker = "RoSnipe constant probe v2"
+                local function child() return marker, probeUpvalue end
+                return child
+            end
+            for _, api in ipairs({ {"getinfo", info}, {"getconstants", constants},
+                {"getprotos", protos}, {"getupvalues", upvalues} }) do
+                if type(api[2]) == "function" then
+                    local passed, result = pcall(api[2], probe)
+                    local entries, marker = 0, false
+                    if passed and type(result) == "table" then
+                        for _, value in next, result do
+                            entries = entries + 1
+                            if value == "RoSnipe constant probe v2" then marker = true end
+                        end
+                    end
+                    append("Local probe " .. api[1] .. ": ok=" .. tostring(passed)
+                        .. " result=" .. type(result) .. " entries=" .. entries
+                        .. (api[1] == "getconstants" and (" expectedConstant=" .. tostring(marker)) or "")
+                        .. (passed and "" or (" error=" .. tostring(result))))
+                else append("Local probe " .. api[1] .. ": unavailable") end
+            end
+
+            local alternateFunctions, functionSeen = {}, {}
+            local function addFunction(fn, origin, depth)
+                if type(fn) ~= "function" or functionSeen[fn] or #alternateFunctions >= 2000 then return end
+                functionSeen[fn] = origin
+                table.insert(alternateFunctions, fn)
+                -- Read prototypes; never execute retrieved game closures.
+                if depth < 3 and type(protos) == "function" then
+                    local passed, children = pcall(protos, fn)
+                    if passed and type(children) == "table" then
+                        local count = 0
+                        for _, child in next, children do
+                            count = count + 1
+                            if count > 100 then break end
+                            addFunction(child, origin .. "/proto", depth + 1)
+                        end
+                    end
+                end
+            end
+            append("Alternate APIs: getscriptclosure=" .. type(getscriptclosure)
+                .. " getscriptfunction=" .. type(getscriptfunction) .. " getsenv=" .. type(getsenv)
+                .. " getscriptbytecode=" .. type(getscriptbytecode) .. " getconnections=" .. type(getconnections))
+            if equipped then
+                append("Tool Enabled=" .. tostring(equipped.Enabled)
+                    .. " ManualActivationOnly=" .. tostring(equipped.ManualActivationOnly)
+                    .. " RequiresHandle=" .. tostring(equipped.RequiresHandle)
+                    .. " Handle=" .. tostring(equipped:FindFirstChild("Handle") ~= nil))
+                local scriptCount = 0
+                for _, scriptObject in ipairs(equipped:GetDescendants()) do
+                    if scriptObject:IsA("LocalScript") or scriptObject:IsA("ModuleScript") then
+                        scriptCount = scriptCount + 1
+                        if scriptCount > 6 then append("[additional tool scripts omitted]"); break end
+                        local path = scriptObject:GetFullName()
+                        append("Tool script=" .. path)
+                        local before = #alternateFunctions
+                        for _, api in ipairs({ {"getscriptclosure", getscriptclosure},
+                            {"getscriptfunction", getscriptfunction} }) do
+                            if type(api[2]) == "function" then
+                                local passed, result = pcall(api[2], scriptObject)
+                                append("  " .. api[1] .. ": ok=" .. tostring(passed) .. " result=" .. type(result)
+                                    .. (passed and "" or (" error=" .. tostring(result))))
+                                if passed then addFunction(result, api[1] .. ":" .. path, 0) end
+                            end
+                        end
+                        if scriptObject:IsA("LocalScript") and type(getsenv) == "function" then
+                            local passed, env = pcall(getsenv, scriptObject)
+                            local entries = 0
+                            if passed and type(env) == "table" then
+                                for _, value in next, env do
+                                    entries = entries + 1
+                                    if entries > 500 then break end
+                                    addFunction(value, "getsenv:" .. path, 0)
+                                end
+                            end
+                            append("  getsenv: ok=" .. tostring(passed) .. " result=" .. type(env)
+                                .. " entries=" .. entries .. (passed and "" or (" error=" .. tostring(env))))
+                        end
+                        if type(getscriptbytecode) == "function" then
+                            local passed, bytes = pcall(getscriptbytecode, scriptObject)
+                            append("  getscriptbytecode: ok=" .. tostring(passed) .. " result=" .. type(bytes)
+                                .. " bytes=" .. (type(bytes) == "string" and #bytes or 0)
+                                .. (passed and "" or (" error=" .. tostring(bytes))))
+                        end
+                        append("  unique closures/protos added=" .. (#alternateFunctions - before))
+                        task.wait()
+                    end
+                end
+                if type(getconnections) == "function" then
+                    local passed, connections = pcall(getconnections, equipped.Activated)
+                    local count, before = 0, #alternateFunctions
+                    if passed and type(connections) == "table" then
+                        for _, connection in next, connections do
+                            count = count + 1
+                            if count > 100 then break end
+                            local readOk, fn = pcall(function() return connection.Function end)
+                            if readOk then addFunction(fn, "Tool.Activated", 0) end
+                        end
+                    end
+                    append("Tool.Activated connections: ok=" .. tostring(passed) .. " count=" .. count
+                        .. " closures/protos added=" .. (#alternateFunctions - before))
+                end
+            end
 
             local function countFunctions(items)
                 if type(items) ~= "table" then return 0, 0 end
@@ -124,13 +229,16 @@ local function runDiagnostic()
                 end
                 return total, functions
             end
-            local gcTrueOk, gcTrueItems = pcall(getgc, true)
+            local gcTrueOk, gcTrueItems = false, "unavailable"
+            if type(getgc) == "function" then gcTrueOk, gcTrueItems = pcall(getgc, true) end
             local trueTotal, trueFunctions = 0, 0
             if gcTrueOk then trueTotal, trueFunctions = countFunctions(gcTrueItems) end
-            local gcFalseOk, gcFalseItems = pcall(getgc, false)
+            local gcFalseOk, gcFalseItems = false, "unavailable"
+            if type(getgc) == "function" then gcFalseOk, gcFalseItems = pcall(getgc, false) end
             local falseTotal, falseFunctions = 0, 0
             if gcFalseOk then falseTotal, falseFunctions = countFunctions(gcFalseItems) end
-            local gcDefaultOk, gcDefaultItems = pcall(getgc)
+            local gcDefaultOk, gcDefaultItems = false, "unavailable"
+            if type(getgc) == "function" then gcDefaultOk, gcDefaultItems = pcall(getgc) end
             local defaultTotal, defaultFunctions = 0, 0
             if gcDefaultOk then defaultTotal, defaultFunctions = countFunctions(gcDefaultItems) end
             append("getgc(true): ok=" .. tostring(gcTrueOk) .. " objects=" .. trueTotal .. " functions=" .. trueFunctions
@@ -151,6 +259,19 @@ local function runDiagnostic()
             if gcDefaultOk and defaultFunctions > bestFunctions then
                 gcItems, gcMode, bestFunctions = gcDefaultItems, "getgc()", defaultFunctions
             end
+            local scanItems = {}
+            for _, fn in next, alternateFunctions do table.insert(scanItems, fn) end
+            for _, fn in next, gcItems do
+                if type(fn) == "function" and not functionSeen[fn] then
+                    functionSeen[fn] = gcMode
+                    table.insert(scanItems, fn)
+                end
+            end
+            append("Alternate closures/protos=" .. #alternateFunctions)
+            if type(constants) ~= "function" then
+                append("Constant inspection unavailable; acquisition results above remain useful.")
+                return
+            end
 
             local executorCheck = isexecutorclosure or checkclosure or (syn and syn.isexecutorclosure)
             local ownFunctions = { [append] = true, [make] = true, [button] = true, [setReport] = true, [runDiagnostic] = true }
@@ -164,10 +285,11 @@ local function runDiagnostic()
             end
             local scanned, infoErrors, constantErrors, excluded, candidateCount = 0, 0, 0, 0, 0
             local sourceCounts, firstInfoError, firstConstantError = {}, nil, nil
-            for _, fn in pairs(gcItems or {}) do
+            for _, fn in ipairs(scanItems) do
                 if type(fn) == "function" then
                     scanned = scanned + 1
-                    local infoOk, details = pcall(info, fn)
+                    local infoOk, details = false, "unavailable"
+                    if type(info) == "function" then infoOk, details = pcall(info, fn) end
                     local infoError = not infoOk and tostring(details) or nil
                     details = infoOk and type(details) == "table" and details or {}
                     local source = tostring(details.source or details.short_src or "unknown")
@@ -176,7 +298,7 @@ local function runDiagnostic()
                     local isExecutor = ownFunctions[fn] == true
                     if type(executorCheck) == "function" then
                         local checked, result = pcall(executorCheck, fn)
-                        isExecutor = isExecutor or (checked and result == true)
+                        isExecutor = isExecutor or (checked and result == true and functionSeen[fn] == gcMode)
                     end
                     if isExecutor then
                         excluded = excluded + 1
@@ -189,24 +311,25 @@ local function runDiagnostic()
                             local hasHitUnit = table.find(values, "hitUnit") ~= nil
                             local named = string.lower(tostring(details.name or "")) == "attempthit"
                             local selectedSource = equipped and string.find(source, "." .. equipped.Name .. ".", 1, true) ~= nil
-                            local activeScript = false
+                            local activeScript = functionSeen[fn] ~= gcMode
                             if type(getfenv) == "function" and equipped then
                                 local envOk, belongs = pcall(function()
                                     local env = getfenv(fn)
                                     local scriptObject = type(env) == "table" and rawget(env, "script")
                                     return typeof(scriptObject) == "Instance" and scriptObject:IsDescendantOf(equipped)
                                 end)
-                                activeScript = envOk and belongs == true
+                                activeScript = activeScript or (envOk and belongs == true)
                             end
                             if hasHitUnit or named or selectedSource or activeScript then
                                 candidateCount = candidateCount + 1
                                 if candidateCount <= 40 then
                                     append("Candidate " .. candidateCount .. ": name=" .. tostring(details.name or "unnamed")
                                         .. " source=" .. source .. " activeScript=" .. tostring(activeScript)
+                                        .. " acquiredVia=" .. tostring(functionSeen[fn])
                                         .. " selectedSource=" .. tostring(selectedSource) .. " hitUnit=" .. tostring(hasHitUnit))
                                     local hasDiagnosticMarker = false
                                     for _, value in pairs(values) do
-                                        if value == "RoSnipe standalone slime-hit diagnostic v1" then hasDiagnosticMarker = true end
+                                        if value == "RoSnipe standalone slime-hit diagnostic v2" then hasDiagnosticMarker = true end
                                     end
                                     if not hasDiagnosticMarker then
                                         for index, value in pairs(values) do append("  constant[" .. tostring(index) .. "]=" .. scalar(value)) end
