@@ -1,7 +1,7 @@
 -- Combat and Cutting hub, based on the supplied NekoHub / Islands.God V4 source.
 -- Original authors: NtOpenProcess and soldo_io.
 -- Requires the same executor APIs and remote GUI library as the original.
--- Windows edition: melee combat uses normal mouse input; other tabs retain their existing implementations.
+-- Windows edition: melee combat uses Tool:Activate(); other tabs retain their existing implementations.
 
 repeat task.wait() until game:IsLoaded()
 
@@ -89,9 +89,6 @@ local stopTotemUpgrade
 local generation = 0
 local combatRequests = 0
 local activeCombatActivation
-local combatInput
-local combatBackend = "Auto"
-local combatCamera
 local lastCombatWalk = 0
 local combatWalking = false
 local combatHealthConnection, observedCombatTarget
@@ -106,33 +103,21 @@ local function releaseCombatActivation(expected)
     return false, tostring(err)
 end
 
-local function restoreCombatCamera()
-    local snapshot = combatCamera
-    combatCamera = nil
-    if snapshot then
-        pcall(function()
-            snapshot.camera.CFrame = snapshot.cframe
-            snapshot.camera.CameraSubject = snapshot.subject
-            snapshot.camera.CameraType = snapshot.kind
-        end)
-    end
-end
-
 local Status = Main:AddParagraph({
     Title = "Status",
-    Content = "Windows combat uses aimed mouse clicks and hovers 10 studs above mobs. Keep Roblox focused and hide RoSnipe with Right Shift.",
+    Content = "Windows combat uses Tool:Activate() and hovers 10 studs above mobs.",
 })
 local AuraStatus = Main:AddParagraph({
     Title = "Slime Aura Status",
     Content = "Off",
 })
 local lastAuraStatus
-local ClickStatus = Main:AddParagraph({ Title = "Auto Click Status", Content = "Off" })
-local lastClickStatus
-local function setClickStatus(message)
-    if state.running and message ~= lastClickStatus then
-        lastClickStatus = message
-        ClickStatus:SetDesc(message)
+local AttackStatus = Main:AddParagraph({ Title = "Auto Attack Status", Content = "Off" })
+local lastAttackStatus
+local function setAttackStatus(message)
+    if state.running and message ~= lastAttackStatus then
+        lastAttackStatus = message
+        AttackStatus:SetDesc(message)
     end
 end
 
@@ -181,7 +166,6 @@ end
 local function stopCombat()
     generation = generation + 1
     releaseCombatActivation()
-    restoreCombatCamera()
     if combatHealthConnection then combatHealthConnection:Disconnect(); combatHealthConnection = nil end
     observedCombatTarget = nil
     local character = LocalPlayer.Character
@@ -275,7 +259,7 @@ local function refreshCombat()
     resolving = false
     if ok and weapon and weapon == selectedCombatTool() then
         combatReady, combatWeapon = true, weapon
-        setStatus("Equipped " .. weapon.Name .. "; Windows mouse combat ready. Hide RoSnipe with Right Shift.")
+        setStatus("Equipped " .. weapon.Name .. "; Tool:Activate() combat ready.")
     elseif not ok then
         setStatus(tostring(weapon)); setAuraStatus(tostring(weapon))
     end
@@ -352,55 +336,11 @@ local function hash()
     return HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)
 end
 
-local function combatClickPause()
+local function combatAttackPause()
     if not windowFocused then return "Paused: focus the Roblox window." end
     if GuiService.MenuIsOpen or UserInputService:GetFocusedTextBox() then
         return "Paused while a menu or text box is open."
     end
-    if not Window.Minimized then return "Hide RoSnipe with Right Shift to start automatic clicks." end
-    if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
-        return "Release the left mouse button to resume automatic clicks."
-    end
-end
-
-local function resolveMouseInput()
-    if combatInput then return combatInput end
-    local choices = combatBackend == "Auto" and { "Executor Mouse", "Roblox VirtualInput", "VirtualInputManager" }
-        or { combatBackend }
-    local errors = {}
-    for _, choice in ipairs(choices) do
-        if choice == "Executor Mouse" then
-            if type(mouse1press) == "function" and type(mouse1release) == "function" and type(mousemoveabs) == "function" then
-                combatInput = {
-                    name = choice,
-                    move = function(point) mousemoveabs(point.X, point.Y) end,
-                    press = mouse1press, release = mouse1release,
-                }
-            else table.insert(errors, "Executor Mouse functions unavailable") end
-        elseif choice == "Roblox VirtualInput" then
-            local ok, input = pcall(function() return UserInputService:CreateVirtualInput() end)
-            if ok and input then
-                combatInput = {
-                    name = choice,
-                    move = function(point) input:SendMousePosition(point) end,
-                    press = function(point) input:SendMouseButton(point, Enum.UserInputType.MouseButton1, true, 0) end,
-                    release = function(point) input:SendMouseButton(point, Enum.UserInputType.MouseButton1, false, 0) end,
-                }
-            else table.insert(errors, "Roblox VirtualInput: " .. tostring(input)) end
-        else
-            local ok, input = pcall(function() return game:GetService("VirtualInputManager") end)
-            if ok and input then
-                combatInput = {
-                    name = choice,
-                    move = function(point) input:SendMouseMoveEvent(point.X, point.Y, game) end,
-                    press = function(point) input:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0) end,
-                    release = function(point) input:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0) end,
-                }
-            else table.insert(errors, "VirtualInputManager: " .. tostring(input)) end
-        end
-        if combatInput then return combatInput end
-    end
-    error("Windows mouse input unavailable: " .. table.concat(errors, "; "), 0)
 end
 
 local function observeCombatHealth(mob, humanoid)
@@ -418,13 +358,13 @@ local function observeCombatHealth(mob, humanoid)
 end
 
 local function attack(mob, farm)
-    local pause = combatClickPause()
+    local pause = combatAttackPause()
     if activeCombatActivation then
         local released, err = releaseCombatActivation()
-        if not released then error("Mouse release blocked: " .. tostring(err), 0) end
-        pause = combatClickPause()
+        if not released then error("Tool deactivation blocked: " .. tostring(err), 0) end
+        pause = combatAttackPause()
     end
-    if pause then restoreCombatCamera(); setClickStatus(pause); return end
+    if pause then setAttackStatus(pause); return end
     local character, _, root = getCharacter()
     if not character or not mob or not mob.Parent then return end
     local mobRoot = mob:FindFirstChild("HumanoidRootPart")
@@ -439,42 +379,24 @@ local function attack(mob, farm)
     if token ~= generation or not state.running or LocalPlayer.Character ~= character then return end
     local distance = (mobRoot.Position - root.Position).Magnitude
     if distance > 12 then
-        restoreCombatCamera()
-        setClickStatus("Waiting to be within normal melee reach (" .. math.floor(distance) .. " studs).")
+            setAttackStatus("Waiting to be within normal melee reach (" .. math.floor(distance) .. " studs).")
         return
     end
     observeCombatHealth(mob, health)
-    local camera = workspace.CurrentCamera
-    if not camera then return end
-    if combatCamera and combatCamera.camera ~= camera then restoreCombatCamera() end
-    if not combatCamera then
-        combatCamera = {camera=camera, cframe=camera.CFrame, subject=camera.CameraSubject, kind=camera.CameraType}
-    end
-    camera.CameraType = Enum.CameraType.Scriptable
-    camera.CFrame = CFrame.lookAt(camera.CFrame.Position, mobRoot.Position)
-    local viewportPoint, visible = camera:WorldToViewportPoint(mobRoot.Position)
-    if not visible then setClickStatus("Slime is outside camera view."); return end
-    -- VirtualInput uses viewport coordinates; the other APIs use window coordinates.
-    local input = resolveMouseInput()
-    local inset = GuiService:GetGuiInset()
-    local point = Vector2.new(math.floor(viewportPoint.X), math.floor(viewportPoint.Y))
-    if input.name ~= "Roblox VirtualInput" then point = point + inset end
-    local activation = {release=function() input.release(point) end}
-    local moved, moveError = pcall(input.move, point)
-    if not moved then error("Windows aim failed using " .. input.name .. ": " .. tostring(moveError), 0) end
-    -- Store the release before pressing so partial failures still release input.
+    assert(not tool.RequiresHandle or tool:FindFirstChild("Handle"), "Selected tool requires a missing Handle.")
+    local activation = {release=function() tool:Deactivate() end}
     activeCombatActivation = activation
-    local pressed, pressError = pcall(input.press, point)
-    if not pressed then
+    local activated, activateError = pcall(function() tool:Activate() end)
+    if not activated then
         releaseCombatActivation(activation)
-        error("Windows click failed using " .. input.name .. ": " .. tostring(pressError), 0)
+        error("Tool activation failed: " .. tostring(activateError), 0)
     end
     task.wait(0.08)
     local released, releaseError = releaseCombatActivation(activation)
-    if not released then error("Mouse release blocked: " .. tostring(releaseError), 0) end
+    if not released then error("Tool deactivation blocked: " .. tostring(releaseError), 0) end
     if token ~= generation or not state.running then return end
     combatRequests = combatRequests + 1
-    setClickStatus(input.name .. " | clicks sent: " .. combatRequests .. " | observed health decreases: " .. observedHealthChanges)
+    setAttackStatus("Tool:Activate() | activations: " .. combatRequests .. " | observed health decreases: " .. observedHealthChanges)
     local message = string.format("%s | health %.1f | distance %.1f studs | observed health lost %.1f",
         mob.Name, health.Health, distance, observedHealthLost)
     if farm then setStatus(message) else setAuraStatus(message) end
@@ -750,27 +672,20 @@ selection:OnChanged(function(options)
     state.selected = selected
     stopCombat()
 end)
-MobSection:AddParagraph({Title="Windows Combat", Content="Normal mouse input, within 12 studs. Hovering is enabled by default and positions you 10 studs above the target. Keep Roblox focused."})
+MobSection:AddParagraph({Title="Windows Combat", Content="Tool:Activate() attacks within 12 studs. Hovering is enabled by default and positions you 10 studs above the target."})
 MobSection:AddToggle("WindowsHoverAboveMobs", {
     Title="Hover 10 Studs Above Mobs", Default=true,
 }):OnChanged(function(value)
     state.hoverMobs=value
     stopCombat()
 end)
-local inputDropdown = MobSection:AddDropdown("WindowsCombatInput", {
-    Title="Windows Mouse Input", Values={"Auto", "Executor Mouse", "Roblox VirtualInput", "VirtualInputManager"}, Default="Auto", Multi=false,
-})
-inputDropdown:OnChanged(function(value)
-    stopCombat()
-    combatBackend, combatInput = value, nil
-    setClickStatus("Input set to " .. value .. ". Hide RoSnipe to resume.")
-end)
+MobSection:AddParagraph({Title="Attack Method", Content="Tool:Activate()"})
 MobSection:AddButton({Title="Copy Windows Combat Report", Callback=function()
     local tool=selectedCombatTool()
     local message=table.concat({"RoSnipe Windows combat report v1", "Selected weapon="..tostring(tool and tool.Name or "none"),
-        "Input selected="..combatBackend.." Active input="..tostring(combatInput and combatInput.name or "none"),
-        "Clicks sent="..combatRequests.." Observed health decreases="..observedHealthChanges.." Observed health lost="..observedHealthLost,
-        "Click status="..tostring(lastClickStatus), "Combat status="..tostring(lastAuraStatus)}, "\n")
+        "Attack method=Tool:Activate()",
+        "Tool activations="..combatRequests.." Observed health decreases="..observedHealthChanges.." Observed health lost="..observedHealthLost,
+        "Attack status="..tostring(lastAttackStatus), "Combat status="..tostring(lastAuraStatus)}, "\n")
     local copy=setclipboard or toclipboard
     if type(copy)=="function" then pcall(copy,message) end
     if type(writefile)=="function" then pcall(writefile,"rosnipe-windows-combat-report.txt",message) end
@@ -788,7 +703,7 @@ farmToggle:OnChanged(function(value)
     stopCombat()
     if value and not combatReady then task.spawn(refreshCombat) end
 end)
-auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Windows Mouse Clicks)", Default = false })
+auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Tool Activate)", Default = false })
 auraToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
     if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: combat enabled.") end
@@ -989,7 +904,7 @@ MobSection:AddSlider("SlimeAuraRange", {
     Callback = function(value) state.auraRange = value end,
 })
 MobSection:AddSlider("SlimeAuraInterval", {
-    Title = "Slime Aura Click Interval", Default = 0.65, Min = 0.25, Max = 2, Rounding = 2,
+    Title = "Slime Aura Attack Interval", Default = 0.65, Min = 0.25, Max = 2, Rounding = 2,
     Callback = function(value) state.auraInterval = value end,
 })
 
@@ -3789,13 +3704,13 @@ task.spawn(function()
                     runBossOnce()
                 elseif state.autoFarm then
                     state.target = findNearestMob(true)
-                    if state.target then attack(state.target, true) else restoreCombatCamera() end
+                    if state.target then attack(state.target, true) end
                 else
                     state.target = nil
                 end
             end)
             if not ok then
-                setClickStatus(tostring(err))
+                setAttackStatus(tostring(err))
                 if state.bossFarm then stopBossFarm("Boss error: "..tostring(err)) end
                 state.autoFarm = false
                 stopCombat()
@@ -3823,18 +3738,18 @@ end)
 
 
 
--- The stationary aura uses the same normal mouse input as Mob Auto Farm.
+-- Slime Aura uses the same Tool:Activate() attack as Mob Auto Farm.
 -- Auto Farm takes precedence if both toggles are enabled, avoiding duplicate bursts.
 task.spawn(function()
     while state.running do
         if state.killAura and not state.autoFarm and not state.bossFarm and combatReady and not resolving then
             local ok, err = pcall(function()
                 local mob, reason = findAuraSlime()
-                if mob then attack(mob, false) else state.auraTarget=nil; restoreCombatCamera(); setAuraStatus(reason) end
+                if mob then attack(mob, false) else state.auraTarget=nil; setAuraStatus(reason) end
             end)
             if not ok then
                 stopCombat()
-                setClickStatus(tostring(err))
+                setAttackStatus(tostring(err))
                 auraToggle:SetValue(false)
                 setAuraStatus("Slime Aura error: " .. tostring(err))
             end
