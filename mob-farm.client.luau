@@ -312,7 +312,9 @@ local function resolveCombat()
                         end
                     end)
                 end
-                local candidate = { fn = closure, depth = details.name == "attemptHit" and 0 or 2 }
+                -- Always inspect the closure itself. Starting non-attemptHit functions at
+                -- depth 2 accidentally skipped their nested prototypes entirely.
+                local candidate = { fn = closure, depth = 0 }
                 if belongsToWeapon then
                     table.insert(ownedCandidates, candidate)
                 elseif not scriptKnown and type(source) == "string"
@@ -329,8 +331,44 @@ local function resolveCombat()
             if inspected and match then return match, weapon end
         end
     end
-    error("No compatible melee hit sender found for " .. weapon.Name
-        .. ". Equip it, hit a slime manually, then refresh combat remotes; a weapon diagnostic may be needed.")
+
+    -- Some Windows executors report every game closure as a CoreGui/loadstring
+    -- source and do not expose the script environment. If source ownership could
+    -- not identify the equipped tool, fall back only to the already verified
+    -- constant layout and a unique matching RemoteEvent. Never infer a hash from
+    -- a partial signature or pick between multiple weapon senders.
+    local fallbackMatches, seenMatches, signatureCandidates, scanned = {}, {}, 0, 0
+    local executorCheck = isexecutorclosure or checkclosure or (syn and syn.isexecutorclosure)
+    for _, closure in pairs(getgc(true)) do
+        if type(closure) == "function" then
+            scanned = scanned + 1
+            local executorClosure = false
+            if type(executorCheck) == "function" then
+                local checked, result = pcall(executorCheck, closure)
+                executorClosure = checked and result == true
+            end
+            if not executorClosure then
+                local read, values = pcall(constants, closure)
+                if read and type(values) == "table" and table.find(values, "hitUnit") then
+                    signatureCandidates = signatureCandidates + 1
+                    local inspected, match = pcall(inspectSender, closure, 0)
+                    if inspected and match then
+                        local identity = match.remote:GetFullName() .. "\0" .. match.key .. "\0" .. match.hash
+                        if not seenMatches[identity] then
+                            seenMatches[identity] = true
+                            table.insert(fallbackMatches, match)
+                        end
+                    end
+                end
+            end
+            if scanned % 200 == 0 then task.wait() end
+        end
+    end
+    if #fallbackMatches == 1 then return fallbackMatches[1], weapon end
+    local reason = #fallbackMatches > 1 and "multiple verified senders matched" or "no verified sender matched"
+    error("No unique compatible melee hit sender found for " .. weapon.Name .. " (" .. reason
+        .. "; functions with hitUnit=" .. signatureCandidates .. "). Equip it, hit a slime manually, "
+        .. "then refresh combat remotes. If this persists on Windows, run mob-hit-diagnostic.client.luau there and share its report.")
 end
 
 local function refreshCombat()
