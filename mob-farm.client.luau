@@ -196,7 +196,7 @@ end
 -- Preferred melee weapons first. Keep both wooden sword IDs: swordWood was
 -- verified in this inventory; woodenSword is the alternate user-provided ID.
 local meleeWeaponOrder = {
-    "cursedHammer", "reapersScythe", "divineDao", "captainsRapier",
+    "cursedHammer", "reaperScythe", "reapersScythe", "divineDao", "captainsRapier",
     "noxiousStinger", "stoneSword", "rageblade", "swordWood", "woodenSword",
     "ironSword", "aquamarineSword", "rubySword", "frostSword", "cutlass",
     "antlerDagger", "jollyDagger", "cactusSpike", "woodenMallet", "graniteHammer",
