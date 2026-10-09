@@ -3089,15 +3089,15 @@ installAutoBuild()
 -- The original crop farm's sickle route; placement shares the verified build resolver.
 local function installFarming()
     local farm = { mode=nil, selected={spiritCrop=true}, range=20, interval=2, batch=10,
-        replant=true, version=0, queue={}, harvested=0, planted=0 }
+        replant=true, version=0, queue={}, harvested=0, planted=0, plowed=0, plowRange=10, plowInterval=0.25 }
     local sickles = {"cletusSickle", "sickleDiamond", "sickleIron", "sickleStone"}
     local crops = {"all", "spiritCrop", "wheat", "carrot", "potato", "onion", "tomato",
         "spinach", "pumpkin", "melon", "pineapple", "starfruit", "dragonfruit",
         "chiliPepper", "grapeVine", "candyCaneVine", "berryBush", "blackberryBush", "blueberryBush"}
     local cropSet = {}
     for _, name in ipairs(crops) do cropSet[name]=true end
-    local status = Farming:AddParagraph({Title="Farming Status", Content="Select crops and enable a farm. Requires a Cletus, stone, iron, or diamond sickle in your hotbar."})
-    local totals = Farming:AddParagraph({Title="Session Totals", Content="Harvested: 0 | Planted: 0"})
+    local status = Farming:AddParagraph({Title="Farming Status", Content="Select crops, plant held seeds, or enable Auto Plow. Use a sickle for harvesting and a plow for nearby grass."})
+    local totals = Farming:AddParagraph({Title="Session Totals", Content="Harvested: 0 | Planted: 0 | Plowed: 0"})
     local toggles, pending = {}, nil
     local changingMode=false
     local lastMessage
@@ -3105,7 +3105,7 @@ local function installFarming()
         lastMessage=text
         if state.running then
             status:SetDesc(text)
-            totals:SetDesc("Harvested: "..farm.harvested.." | Planted: "..farm.planted.." | Pending replants: "..#farm.queue)
+            totals:SetDesc("Harvested: "..farm.harvested.." | Planted: "..farm.planted.." | Plowed: "..farm.plowed.." | Pending replants: "..#farm.queue)
         end
     end
     local function ownBlocks()
@@ -3173,7 +3173,8 @@ local function installFarming()
         changingMode=true
         toggles[mode]:SetValue(true)
         changingMode=false
-        message(mode=="plant" and "Planting held seeds on nearby empty soil." or "Scanning your island for ripe crops.")
+        message(mode=="plow" and "Scanning your island for nearby grass to plow."
+            or (mode=="plant" and "Planting held seeds on nearby empty soil." or "Scanning your island for ripe crops."))
     end
     -- A timed-out InvokeServer stays tracked until it finishes: never stack requests.
     local function invoke(remote, args, current)
@@ -3219,6 +3220,55 @@ local function installFarming()
         until os.clock()>=deadline
         error("Planting "..record.name.." was not confirmed. Check seeds and soil; Save Crop Diagnostic.")
     end
+    local function isPlow(tool)
+        return tool and (tool:FindFirstChild("hoe") ~= nil or tool.Name:lower():find("plow",1,true) ~= nil)
+    end
+    local function runPlow(character, humanoid, root, blocks, current)
+        state.cropDestination=nil
+        local target, part, nearest=nil,nil,farm.plowRange
+        for _,block in ipairs(blocks:GetChildren()) do
+            if block.Name=="grass" then
+                local candidate=partOf(block)
+                local distance=candidate and (candidate.Position-root.Position).Magnitude
+                if distance and distance<=nearest then target,part,nearest=block,candidate,distance end
+            end
+        end
+        if not target then message("No grass within "..farm.plowRange.." studs. Walk to the next patch.");return end
+        local tool=character:FindFirstChildOfClass("Tool")
+        if not isPlow(tool) then
+            local tools=inventory()
+            tool=tools.crystallinePlow or tools.plow
+            if not isPlow(tool) then
+                tool=nil
+                for _,candidate in pairs(tools) do if isPlow(candidate) then tool=candidate;break end end
+            end
+        end
+        assert(tool,"No plow found. Put a plow in your hotbar or Backpack.")
+        if tool.Parent~=character then humanoid:EquipTool(tool);task.wait(0.2) end
+        if not current() then return end
+        assert(tool.Parent==character,"Could not equip "..tool.Name)
+        -- Plowing changes grass to soil; re-check after equipping or waiting.
+        if target.Parent~=blocks or target.Name~="grass" or not part.Parent
+            or (part.Position-root.Position).Magnitude>farm.plowRange then return end
+        local position=part.Position
+        local remote=netManaged():FindFirstChild("CLIENT_PLOW_BLOCK_REQUEST")
+        assert(remote and remote:IsA("RemoteFunction"),"CLIENT_PLOW_BLOCK_REQUEST RemoteFunction not found.")
+        message("Plowing grass with "..tool.Name)
+        -- Original payload. Send one request and confirm soil before counting it.
+        if not invoke(remote,{{block=target}},current) then return end
+        local deadline=os.clock()+2
+        repeat
+            if not current() then return end
+            local block=occupied(blocks,position)
+            if block and block.Name=="soil" then
+                farm.plowed=farm.plowed+1
+                message("Plowed "..farm.plowed.." grass blocks this session.")
+                return
+            end
+            task.wait(0.1)
+        until os.clock()>=deadline
+        error("Plowing was not confirmed. Try the plow manually on nearby grass, then enable Auto Plow again.")
+    end
     local function runOnce()
         local character,humanoid,root=getCharacter()
         if not character then message("Waiting for your character.");return end
@@ -3230,6 +3280,7 @@ local function installFarming()
                 and humanoid.Health>0 and blocks.Parent~=nil
         end
         assert(not pending or pending.done,"Previous crop request is still pending. Wait, then enable farming again.")
+        if farm.mode=="plow" then runPlow(character,humanoid,root,blocks,current);return end
         if farm.mode=="plant" then
             local name=seedCrop(character:FindFirstChildOfClass("Tool"))
             assert(name,"Hold a supported seed tool to use Crop Place Aura (including spirit seeds).")
@@ -3318,6 +3369,14 @@ local function installFarming()
         toggles[mode]=section:AddToggle("CropMode_"..mode,{Title=option[2],Default=false})
         toggles[mode]:OnChanged(function(value) setMode(mode,value) end)
     end
+    local plowing=Farming:AddSection("Plowing")
+    toggles.plow=plowing:AddToggle("AutoPlow",{Title="Auto Plow",Default=false,
+        Description="Plows nearby grass on your island. Walk around to cover more ground."})
+    toggles.plow:OnChanged(function(value) setMode("plow",value) end)
+    plowing:AddSlider("AutoPlowRange",{Title="Plow Range",Default=10,Min=1,Max=30,Rounding=0,
+        Callback=function(value) farm.plowRange=tonumber(value) or farm.plowRange end})
+    plowing:AddSlider("AutoPlowInterval",{Title="Plow Interval (seconds)",Default=0.25,Min=0.1,Max=2,Rounding=2,
+        Callback=function(value) farm.plowInterval=tonumber(value) or farm.plowInterval end})
     section:AddToggle("CropReplant",{Title="Auto Replace Crop",Default=true}):OnChanged(function(value) farm.replant=value end)
     section:AddSlider("CropRange",{Title="Crop Range",Default=20,Min=8,Max=30,Rounding=0,Callback=function(v) farm.range=v end})
     section:AddSlider("CropInterval",{Title="Harvest Interval (seconds)",Default=2,Min=0.5,Max=15,Rounding=1,Callback=function(v) farm.interval=v end})
@@ -3377,7 +3436,8 @@ local function installFarming()
                 local ok,err=pcall(runOnce)
                 if not ok and token==farm.version then stopFarming("Farming error: "..tostring(err)) end
             end
-            task.wait(farm.mode and farm.interval or 0.25)
+            local interval=farm.mode=="plow" and farm.plowInterval or farm.interval
+            task.wait(farm.mode and interval or 0.25)
         end
     end)
 end
