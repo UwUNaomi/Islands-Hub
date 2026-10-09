@@ -54,7 +54,8 @@ local state = {
     rageblade = false,
     weapon = nil,
     selected = { slime = true },
-    height = -10,
+    height = 10,
+    hoverMobs = true,
     speed = 25,
     movement = "Tween",
     target = nil,
@@ -119,7 +120,7 @@ end
 
 local Status = Main:AddParagraph({
     Title = "Status",
-    Content = "Windows combat uses aimed mouse clicks. Keep Roblox focused and hide RoSnipe with Right Shift. Mob Auto Farm walks; Slime Aura stays in place.",
+    Content = "Windows combat uses aimed mouse clicks and hovers 10 studs above mobs. Keep Roblox focused and hide RoSnipe with Right Shift.",
 })
 local AuraStatus = Main:AddParagraph({
     Title = "Slime Aura Status",
@@ -189,6 +190,7 @@ local function stopCombat()
     if combatWalking and humanoid and root then humanoid:MoveTo(root.Position) end
     combatWalking = false
     state.target = nil
+    state.auraTarget = nil
     state.treeTarget = nil
     state.bossDestination = nil
     restoreMovement()
@@ -428,6 +430,7 @@ local function attack(mob, farm)
     local mobRoot = mob:FindFirstChild("HumanoidRootPart")
     local health = mob:FindFirstChildOfClass("Humanoid")
     if not mobRoot or not health or health.Health <= 0 then return end
+    if not farm then state.auraTarget = mob end
     local tool, equippedNow = equipCombatWeapon()
     if not tool or not tool.Enabled then return end
     combatWeapon, combatReady = tool, true
@@ -747,7 +750,13 @@ selection:OnChanged(function(options)
     state.selected = selected
     stopCombat()
 end)
-MobSection:AddParagraph({Title="Windows Combat", Content="Normal mouse input, within 12 studs. Mob Auto Farm walks toward selected mobs. Slime Aura uses your current position. Keep Roblox focused."})
+MobSection:AddParagraph({Title="Windows Combat", Content="Normal mouse input, within 12 studs. Hovering is enabled by default and positions you 10 studs above the target. Keep Roblox focused."})
+MobSection:AddToggle("WindowsHoverAboveMobs", {
+    Title="Hover 10 Studs Above Mobs", Default=true,
+}):OnChanged(function(value)
+    state.hoverMobs=value
+    stopCombat()
+end)
 local inputDropdown = MobSection:AddDropdown("WindowsCombatInput", {
     Title="Windows Mouse Input", Values={"Auto", "Executor Mouse", "Roblox VirtualInput", "VirtualInputManager"}, Default="Auto", Multi=false,
 })
@@ -3702,7 +3711,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
     elseif rageData then
         restoreRageblade()
     end
-    if (state.autoFarm or state.bossFarm) and character and root then
+    if not state.hoverMobs and (state.autoFarm or state.bossFarm) and character and root then
         restoreMovement()
         local targetRoot = state.target and state.target.Parent and state.target:FindFirstChild("HumanoidRootPart")
         local destination = targetRoot and targetRoot.Position or state.bossDestination
@@ -3726,20 +3735,22 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
     elseif state.cropDestination then
         destination = state.cropDestination
     elseif state.treeFarm and validTreeTarget(state.treeTarget) then
-        -- Cutting stands beside the trunk; the -10 offset belongs to Combat only.
+        -- Cutting stands beside the trunk; combat uses its own height offset.
         destination = state.treeTarget.trunk.Position + Vector3.new(0, 0, 6)
     elseif state.bossFarm and state.bossDestination then
         destination = state.bossDestination
-    elseif state.autoFarm or state.bossFarm then
-        local target = state.target
+    elseif state.autoFarm or state.bossFarm or (state.killAura and state.hoverMobs) then
+        local target = (state.autoFarm or state.bossFarm) and state.target or state.auraTarget
         local targetRoot = target and target.Parent and target:FindFirstChild("HumanoidRootPart")
         local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
         if targetRoot and targetHumanoid and targetHumanoid.Health > 0 then
             destination = targetRoot.Position + Vector3.new(0, state.height, 0)
         end
     end
-    -- A boss can die during attack()'s wait. Keep hovering and return immediately,
-    -- rather than dropping the player until the next combat-worker iteration.
+    -- Hold altitude between targets while combat hovering remains enabled.
+    if state.hoverMobs and (state.autoFarm or state.bossFarm or state.killAura) and root and not destination then
+        destination=state.bossFarm and state.bossReturnPosition or root.Position
+    end
     if state.bossFarm and root and not destination then
         destination=state.bossReturnPosition or root.Position
     end
@@ -3819,7 +3830,7 @@ task.spawn(function()
         if state.killAura and not state.autoFarm and not state.bossFarm and combatReady and not resolving then
             local ok, err = pcall(function()
                 local mob, reason = findAuraSlime()
-                if mob then attack(mob, false) else restoreCombatCamera(); setAuraStatus(reason) end
+                if mob then attack(mob, false) else state.auraTarget=nil; restoreCombatCamera(); setAuraStatus(reason) end
             end)
             if not ok then
                 stopCombat()
