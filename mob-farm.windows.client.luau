@@ -3315,7 +3315,7 @@ installAutoBuild()
 -- The original crop farm's sickle route; placement shares the verified build resolver.
 local function installFarming()
     local farm = { mode=nil, selected={spiritCrop=true}, range=20, interval=2, batch=10,
-        replant=true, version=0, queue={}, harvested=0, planted=0, plowed=0, plowRange=10, plowInterval=0.25 }
+        replant=true, version=0, queue={}, harvested=0, planted=0, plowed=0, plowRange=10, plowInterval=0.25, seedSpeed=10 }
     local sickles = {"cletusSickle", "sickleDiamond", "sickleIron", "sickleStone"}
     local crops = {"all", "spiritCrop", "wheat", "carrot", "potato", "onion", "tomato",
         "spinach", "pumpkin", "melon", "pineapple", "starfruit", "dragonfruit",
@@ -3596,6 +3596,10 @@ local function installFarming()
         toggles[mode]=section:AddToggle("CropMode_"..mode,{Title=option[2],Default=false})
         toggles[mode]:OnChanged(function(value) setMode(mode,value) end)
     end
+    section:AddSlider("SeedAuraSpeed",{Title="Seed Aura Speed (plants/sec)",Description="Target speed; planting still waits for each crop to appear.",
+        Default=10,Min=1,Max=20,Rounding=0,Callback=function(value)
+            farm.seedSpeed=math.clamp(tonumber(value) or farm.seedSpeed,1,20)
+        end})
     local plowing=Farming:AddSection("Plowing")
     toggles.plow=plowing:AddToggle("AutoPlow",{Title="Auto Plow",Default=false,
         Description="Plows nearby grass on your island. Walk around to cover more ground."})
@@ -3663,7 +3667,8 @@ local function installFarming()
                 local ok,err=pcall(runOnce)
                 if not ok and token==farm.version then stopFarming("Farming error: "..tostring(err)) end
             end
-            local interval=farm.mode=="plow" and farm.plowInterval or farm.interval
+            local interval=farm.mode=="plow" and farm.plowInterval
+                or (farm.mode=="plant" and 1/farm.seedSpeed or farm.interval)
             task.wait(farm.mode and interval or 0.25)
         end
     end)
