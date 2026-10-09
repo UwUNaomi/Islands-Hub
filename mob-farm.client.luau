@@ -85,6 +85,7 @@ local stopChestPickup
 local stopFarming, resolveCropPlacement
 local stopBossFarm, runBossOnce, setBossStatus
 local stopTotemUpgrade
+local stopCratePackerRecorder
 local generation = 0
 local combatRequests = 0
 local activeCombatActivation
@@ -1715,6 +1716,223 @@ local function installTotemUpgrade()
     end)
 end
 installTotemUpgrade()
+
+-- Capture the game's normal recipe selection before implementing a bulk changer.
+-- No guessed recipe IDs, replay, or remote requests are made by this recorder.
+local function installCratePackerRecorder()
+    local section = Auto:AddSection("T2 CRATE PACKER")
+    local status = Auto:AddParagraph({Title="Crate Packer Status",
+        Content="Select a T2 packer on your island, record, then change its recipe normally. Bulk changing needs the captured recipe request."})
+    local selected, recording, selecting, tap, handler
+    local lines, requests, replies, version, started = {}, 0, 0, 0, 0
+    local filename = "islands-crate-packer-diagnostic.txt"
+    local env = type(getgenv)=="function" and getgenv() or _G
+    local mouse = LocalPlayer:GetMouse()
+    local function message(text)
+        if state.running then status:SetDesc(text) end
+    end
+    local function ownBlocks()
+        local islands=workspace:FindFirstChild("Islands")
+        for _,island in ipairs(islands and islands:GetChildren() or {}) do
+            local owners,blocks=island:FindFirstChild("Owners"),island:FindFirstChild("Blocks")
+            if owners and blocks and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then return blocks end
+        end
+    end
+    local function ownBlockOf(target)
+        local blocks=ownBlocks()
+        while target and target.Parent~=blocks do target=target.Parent end
+        if target and blocks and target.Parent==blocks then return target end
+    end
+    local function show(value,depth,seen)
+        depth,seen=depth or 0,seen or {}
+        local kind=typeof(value)
+        if kind=="Instance" then return value.ClassName..":"..value:GetFullName() end
+        if kind=="string" then return string.format("%q",value:sub(1,240)) end
+        if kind~="table" then return tostring(value):sub(1,240) end
+        if seen[value] then return "<cycle>" end
+        if depth>=5 then return "<table>" end
+        seen[value]=true
+        local out={}
+        for k,v in pairs(value) do
+            if #out>=24 then table.insert(out,"...");break end
+            table.insert(out,show(k,depth+1,seen).."="..show(v,depth+1,seen))
+        end
+        seen[value]=nil;table.sort(out)
+        return "{"..table.concat(out,", ").."}"
+    end
+    local function log(text)
+        if #lines<240 then table.insert(lines,string.format("%.3f | %s",os.clock()-started,text)) end
+    end
+    local function snapshot()
+        if not selected or selected.Parent~=ownBlocks() then return "Selected packer unavailable." end
+        local out={"Block="..show(selected)}
+        for k,v in pairs(selected:GetAttributes()) do table.insert(out,"Attribute "..k.."="..show(v)) end
+        for i,child in ipairs(selected:GetDescendants()) do
+            if i>160 then table.insert(out,"[Remaining descendants omitted]");break end
+            if child:IsA("ValueBase") then
+                table.insert(out,child:GetFullName().."="..show(child.Value))
+            end
+        end
+        local part=selected:IsA("BasePart") and selected or selected:FindFirstChildWhichIsA("BasePart",true)
+        local _,_,root=getCharacter()
+        if part and root then table.insert(out,"Distance="..string.format("%.1f",(part.Position-root.Position).Magnitude)) end
+        table.sort(out);return table.concat(out,"\n")
+    end
+    local function report()
+        return "RoSnipe T2 crate packer recipe diagnostic v1\nPlaceId="..game.PlaceId.." PlaceVersion="..game.PlaceVersion
+            .."\nPassive capture only; normal requests pass through unchanged.\nSelected="..(selected and selected.Name or "none")
+            .."\nOutgoing="..requests.." Replies="..replies.."\n"..table.concat(lines,"\n")
+    end
+    local function save()
+        assert(type(writefile)=="function","writefile unavailable; use Copy Recipe Report.")
+        writefile(filename,report())
+    end
+    local function detach()
+        if tap and tap.handler==handler then tap.handler=nil;tap.after=nil end
+    end
+    stopCratePackerRecorder=function(reason)
+        selecting=false
+        if not recording then detach();return end
+        recording=false;version=version+1
+        local ok,snap=pcall(snapshot);log("FINAL STATE\n"..(ok and snap or tostring(snap)))
+        log(reason or "Stopped.");detach()
+        local saved,err=pcall(save)
+        message(saved and ("Saved "..filename..". Requests="..requests.."; send the report to finish the changer.")
+            or ("Captured "..requests.." requests. Use Copy Recipe Report. "..tostring(err)))
+    end
+    local function containsSelected(value,depth,seen)
+        if typeof(value)=="Instance" then return value==selected or value:IsDescendantOf(selected) end
+        if type(value)~="table" or depth>=5 or seen[value] then return false end
+        seen[value]=true
+        local count=0
+        for _,v in pairs(value) do
+            count=count+1;if count>32 then break end
+            if containsSelected(v,depth+1,seen) then seen[value]=nil;return true end
+        end
+        seen[value]=nil;return false
+    end
+    local function recipeFields(value,depth,seen)
+        if type(value)~="table" or depth>=4 or seen[value] then return false end
+        seen[value]=true;local count=0
+        for k,v in pairs(value) do
+            count=count+1;if count>32 then break end
+            if type(k)=="string" and k:lower():find("recipe",1,true) then seen[value]=nil;return true end
+            if recipeFields(v,depth+1,seen) then seen[value]=nil;return true end
+        end
+        seen[value]=nil;return false
+    end
+    local function installTap(net)
+        assert(type(hookmetamethod)=="function" and type(getnamecallmethod)=="function",
+            "This executor cannot capture namecalls. No recipe request was sent.")
+        local key="RoSnipeCrateRecipeTapV1"
+        tap=env[key]
+        if type(tap)~="table" or not tap.installed then
+            local shared,original={}
+            local function wrapper(remote,...)
+                local method=getnamecallmethod()
+                local observe=shared.handler
+                local ticket
+                if observe and (method=="InvokeServer" or method=="FireServer") then
+                    local ok,value=pcall(observe,remote,method,table.pack(...))
+                    if ok then ticket=value end
+                end
+                if ticket and method=="InvokeServer" then
+                    local result=table.pack(original(remote,...))
+                    if shared.handler==observe and shared.after then pcall(shared.after,ticket,result) end
+                    return table.unpack(result,1,result.n)
+                end
+                return original(remote,...)
+            end
+            if type(newcclosure)=="function" then wrapper=newcclosure(wrapper) end
+            original=hookmetamethod(game,"__namecall",wrapper)
+            assert(type(original)=="function","Namecall capture could not be installed.")
+            shared.installed=true;env[key]=shared;tap=shared
+        end
+        handler=function(remote,method,args)
+            if not state.running or not recording or requests>=40 or typeof(remote)~="Instance" then return end
+            if not selected or selected.Parent~=ownBlocks() or not remote:IsDescendantOf(net) then return end
+            local name=remote.Name:lower()
+            if not containsSelected(args,0,{}) and not recipeFields(args,0,{})
+                and not name:find("recipe",1,true) and not name:find("craft",1,true)
+                and not name:find("packer",1,true) then return end
+            requests=requests+1
+            local ticket={id=requests,path=remote:GetFullName(),time=os.clock(),version=version}
+            log("OUT #"..ticket.id.." "..method.." "..ticket.path.." "..show(args))
+            return ticket
+        end
+        tap.handler=handler
+        tap.after=function(ticket,result)
+            if not state.running or not recording or ticket.version~=version then return end
+            replies=replies+1
+            log("REPLY #"..ticket.id.." "..ticket.path.." elapsed="..string.format("%.3f",os.clock()-ticket.time).." "..show(result))
+        end
+    end
+    local function record()
+        assert(not recording,"Already recording.")
+        assert(selected and selected.Parent==ownBlocks(),"Click Select T2 Packer, then click the packer on your island first.")
+        local net=netManaged()
+        local initial=snapshot()
+        selecting=false;version=version+1;local token=version
+        started=os.clock();lines={};requests,replies=0,0
+        installTap(net)
+        recording=true
+        log("INITIAL STATE\n"..initial)
+        for _,remote in ipairs(net:GetChildren()) do
+            local name=remote.Name:lower()
+            if name:find("recipe",1,true) or name:find("craft",1,true) or name:find("packer",1,true) then
+                log("REMOTE "..remote.ClassName.." "..remote.Name)
+            end
+        end
+        pcall(save)
+        message("Recording for 20 seconds. Open the selected T2 packer and choose a DIFFERENT recipe in the normal game menu.")
+        task.spawn(function()
+            local previous=initial
+            for i=1,80 do
+                task.wait(0.25)
+                if not state.running or not recording or version~=token then return end
+                local ok,current=pcall(snapshot)
+                if ok and current~=previous then log("STATE CHANGE\n"..current);previous=current end
+                if i%16==0 then pcall(save) end
+            end
+            stopCratePackerRecorder("20 seconds completed.")
+        end)
+    end
+    local function guarded(fn)
+        return function()
+            local ok,err=pcall(fn)
+            if not ok then message(tostring(err)) end
+        end
+    end
+    section:AddButton({Title="Select T2 Packer (Click in World)",Callback=guarded(function()
+        assert(not recording,"Stop recording before selecting another packer.")
+        assert(ownBlocks(),"Your island is not loaded.")
+        selecting=true;message("Click your Tier 2 crate packer in the world. Right Shift can hide this window.")
+    end)})
+    table.insert(connections,UserInputService.InputBegan:Connect(function(input,processed)
+        if not state.running or not selecting or processed or input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+        local block=ownBlockOf(mouse.Target)
+        if not block then message("Click a block on your own island.");return end
+        local name=block.Name:lower()
+        if not name:find("crate",1,true) and not name:find("pack",1,true) then
+            message("That block is "..block.Name..". Click your T2 crate packer.");return
+        end
+        selecting=false;selected=block
+        message("Selected "..block.Name..". Record, then change its recipe normally.")
+    end))
+    section:AddButton({Title="Record Recipe Change (20s)",Callback=guarded(record)})
+    section:AddButton({Title="Stop & Save Recipe Report",Callback=guarded(function() stopCratePackerRecorder("Stopped by user.") end)})
+    section:AddButton({Title="Copy Recipe Report",Callback=guarded(function()
+        assert(#lines>0,"Record a recipe change first.")
+        assert(type(setclipboard)=="function","Clipboard unavailable; use Save Recipe Report.")
+        setclipboard(report());message("Recipe report copied.")
+    end)})
+    section:AddButton({Title="Save Recipe Report",Callback=guarded(function()
+        assert(#lines>0,"Record a recipe change first.")
+        save();message("Saved "..filename)
+    end)})
+end
+installCratePackerRecorder()
+
 
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
@@ -3572,6 +3790,7 @@ installBossFarm()
 
 local function shutdown()
     if not state.running then return end
+    if stopCratePackerRecorder then stopCratePackerRecorder("Hub unloaded.") end
     if stopChestPickup then stopChestPickup(true) end
     if stopTotemUpgrade then stopTotemUpgrade() end
     if stopBossFarm then stopBossFarm() end
@@ -3600,6 +3819,7 @@ table.insert(connections, UserInputService.WindowFocused:Connect(function()
     windowFocused = true
 end))
 table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
+    if stopCratePackerRecorder then stopCratePackerRecorder("Character respawning.") end
     if stopBossFarm then stopBossFarm("Stopped: character respawning.") end
     if stopFarming then stopFarming("Stopped: character respawning.") end
     if stopAutoBuild then stopAutoBuild("Stopped: character respawning.") end
