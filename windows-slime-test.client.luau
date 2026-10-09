@@ -1,17 +1,15 @@
 -- Windows/Xeno attack compatibility test. Uses the equipped weapon's own code.
 -- No hash lookup, remote replay, movement, flight, noclip, or attack hooks.
--- Stand beside a slime, equip your weapon, choose a method, and press Start.
+-- Stand beside a slime, equip your weapon, and press Start.
 
 repeat task.wait() until game:IsLoaded()
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
 local player = Players.LocalPlayer
-local methods = { "Tool Activate", "VirtualInputManager", "Executor Mouse" }
-local methodIndex, running, closed = 1, false, false
+local running, closed = false, false
 local attempts, observedDamage, lastError = 0, 0, nil
-local healthSamples, log = {}, { "RoSnipe Windows attack test v1" }
-local cameraSnapshot, virtualManager, heldMethod, heldX, heldY, activeTool
+local healthSamples, log = {}, { "RoSnipe Windows Tool Activate test v2" }
+local cameraSnapshot, activeTool
 local INTERVAL, RANGE = 0.65, 12
 
 local function create(class, properties, parent)
@@ -52,18 +50,13 @@ local function button(text, x, y, width, callback)
     b.Activated:Connect(callback)
     return b
 end
-local startButton, methodButton
+local startButton
 local function release()
-    local method, x, y = heldMethod, heldX, heldY
-    heldMethod = nil
-    if method == "VirtualInputManager" and virtualManager then
-        local ok, err = pcall(function() virtualManager:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
-        if not ok then heldMethod = method; return false, tostring(err) end
-    elseif method == "Executor Mouse" and type(mouse1release) == "function" then
-        local ok, err = pcall(mouse1release)
-        if not ok then heldMethod = method; return false, tostring(err) end
+    if activeTool then
+        local ok, err = pcall(function() activeTool:Deactivate() end)
+        if not ok then return false, tostring(err) end
+        activeTool = nil
     end
-    if activeTool then pcall(function() activeTool:Deactivate() end); activeTool = nil end
     return true
 end
 local function restoreCamera()
@@ -81,7 +74,7 @@ local function stop(reason)
     running = false
     local released, err = release()
     restoreCamera()
-    if not released then lastError = "Mouse release failed: " .. tostring(err) end
+    if not released then lastError = "Tool deactivation failed: " .. tostring(err) end
     if startButton then startButton.Text = "Start" end
     if not closed then status.Text = not released and lastError or (reason or "Stopped.") end
 end
@@ -113,61 +106,33 @@ local function aim(mob)
     end
     camera.CameraType = Enum.CameraType.Scriptable
     camera.CFrame = CFrame.lookAt(camera.CFrame.Position, root.Position)
-    local point, visible = camera:WorldToViewportPoint(root.Position)
-    assert(visible, "Slime is outside the camera view")
-    local inset = GuiService:GetGuiInset()
-    local x, y = math.floor(point.X + inset.X), math.floor(point.Y + inset.Y)
-    for _, object in ipairs(player.PlayerGui:GetGuiObjectsAtPosition(x, y)) do
-        if object:IsDescendantOf(panel) then error("Test panel covers the target. Hide it with Right Shift.") end
-    end
-    -- CoreGui-parented panels do not appear in PlayerGui's hit test.
-    local pos, size = panel.AbsolutePosition, panel.AbsoluteSize
-    if panel.Visible and x >= pos.X and x <= pos.X + size.X and y >= pos.Y and y <= pos.Y + size.Y then
-        error("Test panel covers the target. Hide it with Right Shift.")
-    end
-    return x, y
 end
 local function attack(mob)
     local tool = player.Character and player.Character:FindFirstChildOfClass("Tool")
     assert(tool, "No equipped Tool")
     assert(tool.Enabled, "Equipped Tool is disabled")
     assert(not tool.RequiresHandle or tool:FindFirstChild("Handle"), "Tool requires a missing Handle")
-    local x, y = aim(mob)
-    local method = methods[methodIndex]
-    if method == "Tool Activate" then
-        activeTool = tool
-        tool:Activate()
-    elseif method == "VirtualInputManager" then
-        virtualManager = virtualManager or game:GetService("VirtualInputManager")
-        virtualManager:SendMouseMoveEvent(x, y, game)
-        heldMethod, heldX, heldY = method, x, y
-        virtualManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
-    else
-        assert(type(mouse1press) == "function" and type(mouse1release) == "function", "mouse1press/mouse1release unavailable")
-        assert(type(mousemoveabs) == "function", "mousemoveabs unavailable; cannot aim this input method")
-        mousemoveabs(x, y)
-        heldMethod, heldX, heldY = method, x, y
-        mouse1press()
-    end
+    aim(mob)
+    activeTool = tool
+    tool:Activate()
     task.wait(0.06)
     local released, err = release()
     assert(released, err)
     attempts = attempts + 1
 end
 local function report()
-    return table.concat(log, "\n") .. "\nMethod=" .. methods[methodIndex] .. " Attempts=" .. attempts
+    return table.concat(log, "\n") .. "\nMethod=Tool Activate Attempts=" .. attempts
         .. " Observed health decreases=" .. observedDamage .. " Last error=" .. tostring(lastError or "none")
 end
-methodButton = button("Method: " .. methods[1], 12, 144, 321, function()
-    stop("Method changed. Press Start to test it.")
-    methodIndex = methodIndex % #methods + 1
-    attempts, observedDamage, healthSamples, lastError = 0, 0, {}, nil
-    methodButton.Text = "Method: " .. methods[methodIndex]
-end)
+create("TextLabel", {
+    Position = UDim2.fromOffset(12, 144), Size = UDim2.fromOffset(321, 34),
+    Text = "Attack method: Tool:Activate()", Font = Enum.Font.GothamSemibold, TextSize = 13,
+    BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(50, 35, 43),
+}, panel)
 startButton = button("Start", 12, 188, 155, function()
     if running then stop(); return end
     local released, err = release()
-    if not released then status.Text = "Cannot release the previous click: " .. tostring(err); return end
+    if not released then status.Text = "Cannot deactivate the previous tool: " .. tostring(err); return end
     running, lastError = true, nil
     startButton.Text = "Stop"
 end)
@@ -197,10 +162,10 @@ task.spawn(function()
                 local ok, err = pcall(attack, mob)
                 if not ok then
                     lastError = tostring(err)
-                    table.insert(log, methods[methodIndex] .. ": " .. lastError)
+                    table.insert(log, "Tool Activate: " .. lastError)
                     stop("Attack failed: " .. lastError)
                 elseif running and not closed then
-                    status.Text = methods[methodIndex] .. " | " .. mob.Name .. " | " .. math.floor(distance) .. " studs\n"
+                    status.Text = "Tool Activate | " .. mob.Name .. " | " .. math.floor(distance) .. " studs\n"
                         .. "Attempts: " .. attempts .. " | Health decreases observed: " .. observedDamage
                         .. "\nWatch slime health to confirm damage. Right Shift hides this panel."
                 end
