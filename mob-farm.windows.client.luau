@@ -207,6 +207,13 @@ local meleeWeaponOrder = {
 local meleeWeaponSet = {}
 for _, name in ipairs(meleeWeaponOrder) do meleeWeaponSet[name] = true end
 
+local function registerCombatWeapon(name)
+    if not meleeWeaponSet[name] then
+        meleeWeaponSet[name] = true
+        table.insert(meleeWeaponOrder, name)
+    end
+end
+
 local function scanCombatInventory()
     local found, equipped = {}, nil
     local character = LocalPlayer.Character
@@ -214,6 +221,12 @@ local function scanCombatInventory()
     local function scan(container, worn)
         if not container then return end
         for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") then
+                local name = item.Name:lower()
+                if name:find("reaper", 1, true) and name:find("scythe", 1, true) then
+                    registerCombatWeapon(item.Name)
+                end
+            end
             if item:IsA("Tool") and meleeWeaponSet[item.Name] then
                 if not found[item.Name] then found[item.Name] = item end
                 if worn and not equipped then equipped = item.Name end
@@ -643,6 +656,22 @@ weaponDropdown:OnChanged(function(value)
     invalidateWeapon()
     refreshWeaponInventory()
 end)
+MobSection:AddButton({
+    Title = "Use Equipped Weapon",
+    Description = "Equip your melee weapon first. Uses its exact Tool name, including unlisted scythe IDs.",
+    Callback = function()
+        local character = LocalPlayer.Character
+        local tool = character and character:FindFirstChildOfClass("Tool")
+        if not tool then
+            setStatus("Equip your melee weapon, then press Use Equipped Weapon.")
+            return
+        end
+        registerCombatWeapon(tool.Name)
+        state.weapon = tool.Name
+        lastWeaponInstance = nil
+        refreshWeaponInventory()
+    end,
+})
 MobSection:AddButton({ Title = "Refresh Weapon Inventory", Callback = refreshWeaponInventory })
 refreshWeaponInventory()
 task.spawn(function()
