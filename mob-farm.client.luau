@@ -366,32 +366,6 @@ local function resolveCombat()
     end
     if #fallbackMatches == 1 then return fallbackMatches[1], weapon end
 
-    -- Xeno 11 Pro on Windows can expose getgc as a table-only stub: the user's
-    -- report had 31,533 objects but zero functions. A Mac diagnostic captured
-    -- this exact sender while cursedHammer was equipped in this place/version.
-    -- Keep the fallback tightly gated so stale constants are never reused after
-    -- a game update or for a different weapon.
-    if game.PlaceId == 4872321990 and game.PlaceVersion == 1246 and weapon.Name == "cursedHammer" then
-        local remoteSuffix = "UlpaomJfNzwc"
-        local expectedRemoteSuffix = "/" .. remoteSuffix
-        local matchedRemote
-        for _, remote in ipairs(net:GetChildren()) do
-            if remote:IsA("RemoteEvent") and remote.Name:sub(-#expectedRemoteSuffix) == expectedRemoteSuffix then
-                if matchedRemote then
-                    matchedRemote = nil
-                    break
-                end
-                matchedRemote = remote
-            end
-        end
-        if matchedRemote then
-            local knownHash = string.char(7) .. "🤣🤡" .. string.char(7)
-                .. "\\" .. string.char(10) .. string.char(7)
-                .. "\\" .. string.char(10) .. string.char(7)
-                .. "\\" .. string.char(10) .. "efmmgivC"
-            return { remote = matchedRemote, key = "IucpoZdgwp", hash = knownHash }, weapon
-        end
-    end
     local reason = #fallbackMatches > 1 and "multiple verified senders matched" or "no verified sender matched"
     error("No unique compatible melee hit sender found for " .. weapon.Name .. " (" .. reason
         .. "; functions with hitUnit=" .. signatureCandidates .. "). Equip it, hit a slime manually, "
