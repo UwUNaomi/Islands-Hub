@@ -40,6 +40,7 @@ end
 local Main = Window:AddTab({ Title = "Combat", Icon = "sword" })
 local Cutting = Window:AddTab({ Title = "Cutting", Icon = "axe" })
 local Farming = Window:AddTab({ Title = "Farming", Icon = "leaf" })
+local MovementTab = Window:AddTab({ Title = "Movement", Icon = "footprints" })
 local Auto = Window:AddTab({ Title = "Auto", Icon = "package" })
 local AutoBuild = Window:AddTab({ Title = "Autobuild", Icon = "building-2" })
 local GhostPreview = Window:AddTab({ Title = "Ghost Preview", Icon = "eye" })
@@ -85,6 +86,7 @@ local stopChestPickup
 local stopFarming, resolveCropPlacement
 local stopBossFarm, runBossOnce, setBossStatus
 local stopTotemUpgrade
+local stopAirWalk
 local stopCratePackerRecorder
 local generation = 0
 local combatRequests = 0
@@ -815,6 +817,7 @@ MobSection:AddSlider("MobHeight", {
 farmToggle = MobSection:AddToggle("MobAutoFarmToggle", { Title = "Mob Auto Farm", Default = false })
 farmToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopAirWalk then stopAirWalk("Stopped: combat enabled.") end
     if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: combat enabled.") end
     if value and stopBossFarm then stopBossFarm() end
     if value and stopCutting then stopCutting() end
@@ -826,6 +829,7 @@ end)
 auraToggle = MobSection:AddToggle("MobKillAuraToggle", { Title = "Slime Aura (Auto Click + Remote)", Default = false })
 auraToggle:OnChanged(function(value)
     if value and stopAutoBuild then stopAutoBuild("Stopped: combat enabled.") end
+    if value and stopAirWalk then stopAirWalk("Stopped: combat enabled.") end
     if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: combat enabled.") end
     if value and stopBossFarm then stopBossFarm() end
     if value and stopCutting then stopCutting() end
@@ -1106,6 +1110,7 @@ stopCutting = function()
     setTreeStatus("Off")
 end
 local function setCuttingMode(mode, value)
+    if value and stopAirWalk then stopAirWalk("Stopped: cutting enabled.") end
     if value and stopTotemUpgrade then stopTotemUpgrade("Stopped: cutting enabled.") end
     if value and stopBossFarm then stopBossFarm() end
     if value and stopFarming then stopFarming() end
@@ -1327,6 +1332,7 @@ local function installChestPickup()
         return total
     end
     toggle:OnChanged(function(enabled)
+        if enabled and stopAirWalk then stopAirWalk("Stopped: chest pickup enabled.") end
         if enabled and stopTotemUpgrade then stopTotemUpgrade("Stopped: chest pickup enabled.") end
         generation=generation+1
         local token=generation
@@ -1641,6 +1647,7 @@ local function installTotemUpgrade()
         local token = generation
         running = true
         state.totemUpgrade = true
+        if stopAirWalk then stopAirWalk("Stopped: totem upgrade enabled.") end
         state.totemDestination = nil
         -- Keep the shared movement controller from fighting another active farm.
         if stopAutoBuild then stopAutoBuild("Stopped: totem upgrade enabled.") end
@@ -2515,6 +2522,7 @@ local function installAutoBuild()
     end
     stopAutoBuild = stop
     local function stopFarms()
+        if stopAirWalk then stopAirWalk("Stopped: auto build enabled.") end
         if stopTotemUpgrade then stopTotemUpgrade("Stopped: auto build enabled.") end
         if stopBossFarm then stopBossFarm() end
         if stopFarming then stopFarming() end
@@ -3324,6 +3332,7 @@ local function installFarming()
     local function setMode(mode, value)
         if changingMode then return end
         if not value then if farm.mode==mode then stopFarming() end;return end
+        if stopAirWalk then stopAirWalk("Stopped: crop farming enabled.") end
         if stopTotemUpgrade then stopTotemUpgrade("Stopped: crop farming enabled.") end
         stopFarming()
         if stopBossFarm then stopBossFarm() end
@@ -3720,6 +3729,7 @@ local function installBossFarm()
     toggle=section:AddToggle("BossAutoFarm",{Title="Boss Auto Farm (Slime King)",Default=false})
     toggle:OnChanged(function(value)
         if not value then if state.bossFarm then stopBossFarm() end;return end
+        if stopAirWalk then stopAirWalk("Stopped: boss farming enabled.") end
         if stopTotemUpgrade then stopTotemUpgrade("Stopped: boss farming enabled.") end
         farmToggle:SetValue(false);auraToggle:SetValue(false)
         if stopCutting then stopCutting() end
@@ -3788,8 +3798,109 @@ local function installBossFarm()
 end
 installBossFarm()
 
+-- A local floor follows horizontal movement. Normal jumps raise its height.
+local function installAirWalk()
+    local section=MovementTab:AddSection("Air Walk")
+    local status=MovementTab:AddParagraph({Title="Movement Status",Content="Off. Air Walk holds your height; walk normally and jump to climb."})
+    local toggle=section:AddToggle("AirWalk",{Title="Air Walk",Default=false,
+        Description="Walk on air with normal movement keys. Each jump raises your floating height."})
+    local enabled,changing=false,false
+    local platform,activeRoot,top,peak,jumping
+    local function message(text)
+        if state.running then status:SetDesc(text) end
+    end
+    local function clearFloor()
+        if platform then platform:Destroy() end
+        platform,activeRoot,top,peak,jumping=nil,nil,nil,nil,false
+    end
+    local function feetHeight(character,humanoid,root)
+        local offset=humanoid.HipHeight+root.Size.Y/2
+        if humanoid.RigType==Enum.HumanoidRigType.R6 then
+            local leg=character:FindFirstChild("Left Leg") or character:FindFirstChild("Right Leg")
+            offset=offset+(leg and leg.Size.Y or 2)
+        end
+        return root.Position.Y-offset
+    end
+    local function placeFloor(root)
+        platform.CFrame=CFrame.new(root.Position.X,top-platform.Size.Y/2,root.Position.Z)
+    end
+    local function createFloor(character,humanoid,root)
+        clearFloor()
+        activeRoot=root
+        top=feetHeight(character,humanoid,root)-0.05
+        peak=top
+        platform=Instance.new("Part")
+        platform.Name="RoSnipeAirWalkFloor"
+        platform.Size=Vector3.new(10,0.5,10)
+        platform.Anchored=true
+        platform.Transparency=1
+        platform.CanCollide=true
+        platform.CanTouch=false
+        platform.CanQuery=false
+        placeFloor(root)
+        platform.Parent=workspace
+        message("Air Walk on. Walk normally; jump to climb. Lower Height moves down 3 studs.")
+    end
+    stopAirWalk=function(reason)
+        enabled=false;clearFloor()
+        if toggle.Value then
+            changing=true;toggle:SetValue(false);changing=false
+        end
+        message(reason or "Air Walk off.")
+    end
+    toggle:OnChanged(function(value)
+        if changing then return end
+        if not value then stopAirWalk();return end
+        -- Let manual movement have the character while Air Walk is enabled.
+        if stopAutoBuild then stopAutoBuild("Stopped: Air Walk enabled.") end
+        if stopChestPickup then stopChestPickup(false) end
+        if stopTotemUpgrade then stopTotemUpgrade("Stopped: Air Walk enabled.") end
+        if stopBossFarm then stopBossFarm("Stopped: Air Walk enabled.") end
+        if stopFarming then stopFarming("Stopped: Air Walk enabled.") end
+        if stopCutting then stopCutting() end
+        farmToggle:SetValue(false);auraToggle:SetValue(false)
+        stopCombat()
+        enabled=true
+        local character,humanoid,root=getCharacter()
+        if root then createFloor(character,humanoid,root)
+        else message("Air Walk waiting for your character.") end
+    end)
+    section:AddButton({Title="Lower Height (3 Studs)",Callback=function()
+        if not enabled or not platform then message("Enable Air Walk first.");return end
+        top=top-3;peak=top;jumping=false
+        -- Clear the ascent left over from a jump before lowering the floor.
+        local velocity=activeRoot.AssemblyLinearVelocity
+        activeRoot.AssemblyLinearVelocity=Vector3.new(velocity.X,math.min(velocity.Y,0),velocity.Z)
+        placeFloor(activeRoot)
+    end})
+    table.insert(connections,RunService.Heartbeat:Connect(function()
+        if not state.running or not enabled then return end
+        local character,humanoid,root=getCharacter()
+        if not root then clearFloor();return end
+        if root~=activeRoot or not platform or not platform.Parent then
+            createFloor(character,humanoid,root)
+        end
+        local feet=feetHeight(character,humanoid,root)
+        local rising=root.AssemblyLinearVelocity.Y
+        -- Leave the floor behind during ascent so jumping behaves normally.
+        if not jumping and feet>top+0.5 and rising>1 then
+            jumping=true;peak=feet
+        end
+        if jumping then
+            peak=math.max(peak,feet)
+            if rising<=0 then
+                top=math.max(top,peak);jumping=false
+            end
+        end
+        placeFloor(root)
+    end))
+end
+installAirWalk()
+
+
 local function shutdown()
     if not state.running then return end
+    if stopAirWalk then stopAirWalk("Hub unloaded.") end
     if stopCratePackerRecorder then stopCratePackerRecorder("Hub unloaded.") end
     if stopChestPickup then stopChestPickup(true) end
     if stopTotemUpgrade then stopTotemUpgrade() end
@@ -3819,6 +3930,7 @@ table.insert(connections, UserInputService.WindowFocused:Connect(function()
     windowFocused = true
 end))
 table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
+    if stopAirWalk then stopAirWalk("Stopped: character respawning.") end
     if stopCratePackerRecorder then stopCratePackerRecorder("Character respawning.") end
     if stopBossFarm then stopBossFarm("Stopped: character respawning.") end
     if stopFarming then stopFarming("Stopped: character respawning.") end
