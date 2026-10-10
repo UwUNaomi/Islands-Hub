@@ -1973,7 +1973,7 @@ installCratePackerRecorder()
 -- Auto Build: adapted from the original Block Printer, with local preview state.
 local function installAutoBuild()
     local build = { speed = 10, nearbyFirst = true, travelSpeed = 25, teleport = true, moveNear = false, autoReach = true, useRadius = false, radius = 85,
-        retryPasses = 4, showHUD = true, noclip = true, paused = false, saveName = "mybuild", collision = false, records = {},
+        retryPasses = 4, showHUD = true, noclip = true, paused = false, saveName = "mybuild", collision = false, records = {}, excluded = {}, review = nil,
         version = 0, busy = false, mode = nil, file = "Template", folder = "RoSnipe/Schematica", loadNearPlayer = true, events = {}, actions = {} }
     local function trace(kind, message)
         table.insert(build.events, {time=os.clock(), kind=kind, message=tostring(message)})
@@ -2079,7 +2079,7 @@ local function installAutoBuild()
     local bomPanel = Instance.new("Frame")
     bomPanel.AnchorPoint = Vector2.new(1, 0.5)
     bomPanel.Position = UDim2.new(1, -20, 0.5, 0)
-    bomPanel.Size = UDim2.fromOffset(336, 390)
+    bomPanel.Size = UDim2.fromOffset(400, 520)
     bomPanel.BorderSizePixel = 0
     bomPanel.Parent = bomGui
     local round = Instance.new("UICorner")
@@ -2099,7 +2099,7 @@ local function installAutoBuild()
         return card
     end
     local bomSummary = bomCard("SummaryCard", 48, UDim2.new(1, -24, 0, 120))
-    local bomMaterials = bomCard("MaterialsCard", 178, UDim2.new(1, -24, 1, -190))
+    local bomMaterials = bomCard("MaterialsCard", 178, UDim2.new(1, -24, 1, -242))
     local function bomLabel(parent, y, height, size)
         local label = Instance.new("TextLabel")
         label.BackgroundTransparency = 1
@@ -2126,7 +2126,7 @@ local function installAutoBuild()
     bomNote.Name = "Note"
     bomNote.TextColor3 = Color3.fromRGB(119, 103, 113)
     local bomMaterialsTitle = bomLabel(bomMaterials, 12, 18, 11)
-    bomMaterialsTitle.Text = "MATERIALS"
+    bomMaterialsTitle.Text = "MATERIALS • CLICK TO SKIP / RESTORE"
     bomMaterialsTitle.Font = Enum.Font.GothamBold
     bomMaterialsTitle.TextColor3 = Color3.fromRGB(149, 83, 112)
     local bomScroll = Instance.new("ScrollingFrame")
@@ -2135,14 +2135,29 @@ local function installAutoBuild()
     bomScroll.BackgroundTransparency, bomScroll.BorderSizePixel = 1, 0
     bomScroll.ScrollBarThickness = 4
     bomScroll.Parent = bomMaterials
-    local bomRows = Instance.new("TextLabel")
-    bomRows.Name = "Materials"
-    bomRows.BackgroundTransparency = 1
-    bomRows.Font, bomRows.TextSize = Enum.Font.Gotham, 13
-    bomRows.LineHeight = 1.6
-    bomRows.TextColor3 = Color3.fromRGB(53, 42, 49)
-    bomRows.TextXAlignment, bomRows.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
-    bomRows.Parent = bomScroll
+    local bomButtons={}
+    local renderBOM,samplePlaced,beginReviewedBuild,persistLastBuild
+    local bomBuild=Instance.new("TextButton")
+    bomBuild.Size=UDim2.new(1,-114,0,34)
+    bomBuild.Position=UDim2.new(0,12,1,-46)
+    bomBuild.BackgroundColor3=Color3.fromRGB(255,255,255)
+    bomBuild.TextColor3=Color3.fromRGB(53,42,49)
+    bomBuild.Font,bomBuild.TextSize=Enum.Font.GothamBold,12
+    bomBuild.BorderSizePixel=0
+    bomBuild.Visible=false;bomBuild.Parent=bomPanel
+    local buildCorner=Instance.new("UICorner");buildCorner.CornerRadius=UDim.new(0,7);buildCorner.Parent=bomBuild
+    connect(bomBuild.MouseButton1Click,function()
+        local ok,err=pcall(beginReviewedBuild)
+        if not ok then status(tostring(err)) end
+    end)
+    local bomEnableAll=Instance.new("TextButton")
+    bomEnableAll.Size=UDim2.fromOffset(80,34)
+    bomEnableAll.Position=UDim2.new(1,-92,1,-46)
+    bomEnableAll.BackgroundColor3=Color3.fromRGB(255,255,255)
+    bomEnableAll.TextColor3=Color3.fromRGB(53,42,49)
+    bomEnableAll.Font,bomEnableAll.TextSize=Enum.Font.Gotham,11
+    bomEnableAll.Text="Enable All";bomEnableAll.BorderSizePixel=0;bomEnableAll.Parent=bomPanel
+    local allCorner=Instance.new("UICorner");allCorner.CornerRadius=UDim.new(0,7);allCorner.Parent=bomEnableAll
     local bomClose = Instance.new("TextButton")
     bomClose.Text, bomClose.TextSize, bomClose.BackgroundTransparency = "×", 22, 1
     bomClose.Size = UDim2.fromOffset(28, 28)
@@ -2160,52 +2175,172 @@ local function installAutoBuild()
     connect(windowPaint:GetPropertyChangedSignal("BackgroundColor3"), paintBOM)
     connect(KillLabel:GetPropertyChangedSignal("TextColor3"), paintBOM)
     paintBOM()
+    local previewStyles=setmetatable({}, {__mode="k"})
+    local function copyExclusions(source)
+        local copied={}
+        for name,excluded in pairs(source or build.excluded) do
+            if type(name)=="string" and excluded==true then copied[name]=true end
+        end
+        return copied
+    end
+    local function blockEnabled(record)
+        return build.excluded[record.name]~=true
+    end
+    local function paintPreviewFilters()
+        for _,record in ipairs(build.records) do
+            local root=record.preview
+            if root and root.Parent then
+                local parts={root}
+                for _,part in ipairs(root:GetDescendants()) do
+                    if part:IsA("BasePart") then table.insert(parts,part) end
+                end
+                for _,part in ipairs(parts) do
+                    local original=previewStyles[part]
+                    if not original then
+                        original={color=part.Color,transparency=part.Transparency}
+                        previewStyles[part]=original
+                    end
+                    local enabled=blockEnabled(record)
+                    part.Color=enabled and original.color or Color3.fromRGB(150,150,156)
+                    part.Transparency=enabled and original.transparency or 0.8
+                    part.CanCollide=enabled and part==root and build.collision or false
+                end
+            end
+        end
+    end
+    local function inventoryCounts()
+        local counts,seen={},{}
+        for _,container in pairs({LocalPlayer:FindFirstChild("Backpack"),LocalPlayer.Character}) do
+            if container then
+                for _,item in ipairs(container:GetChildren()) do
+                    if item:IsA("Tool") and not seen[item] then
+                        seen[item]=true
+                        local amount=item:FindFirstChild("Amount")
+                        local raw=amount and amount:IsA("ValueBase") and amount.Value
+                            or item:GetAttribute("Amount") or item:GetAttribute("amount")
+                        local quantity=raw~=nil and tonumber(raw) or 1
+                        if quantity and quantity==quantity then counts[item.Name]=(counts[item.Name] or 0)+math.max(0,math.floor(quantity)) end
+                    end
+                end
+            end
+        end
+        -- Some clients also mirror inventory as numeric values. Do not double count.
+        for _,folderName in ipairs({"Inventory","inventory"}) do
+            local folder=LocalPlayer:FindFirstChild(folderName)
+            if folder then
+                local mirrored={}
+                for _,item in ipairs(folder:GetChildren()) do
+                    local amount=item:FindFirstChild("Amount")
+                    local raw=item:IsA("ValueBase") and item.Value
+                        or (amount and amount:IsA("ValueBase") and amount.Value)
+                    local quantity=tonumber(raw)
+                    if quantity and quantity==quantity then mirrored[item.Name]=(mirrored[item.Name] or 0)+math.max(0,math.floor(quantity)) end
+                end
+                for name,quantity in pairs(mirrored) do counts[name]=math.max(counts[name] or 0,quantity) end
+            end
+        end
+        return counts
+    end
     local function newBOM(records)
-        local report = {records=records, total=#records, placed=0, sent=0, byName={}, names={}, phase="Ready", existing=0}
-        for _, record in ipairs(records) do
-            local row = report.byName[record.name]
+        local report={records=records,fullTotal=#records,total=0,placed=0,sent=0,byName={},names={},phase="Ready",existing=0}
+        for _,record in ipairs(records) do
+            local row=report.byName[record.name]
             if not row then
                 row={total=0,placed=0}
-                report.byName[record.name]=row
-                table.insert(report.names,record.name)
+                report.byName[record.name]=row;table.insert(report.names,record.name)
             end
             row.total=row.total+1
+            if blockEnabled(record) then report.total=report.total+1 end
         end
         table.sort(report.names)
         return report
     end
-    local function renderBOM()
+    local function measureBOM(report)
+        local inventory=inventoryCounts()
+        report.total,report.placed,report.skipped,report.shortage,report.shortTypes=0,0,0,0,0
+        for _,name in ipairs(report.names) do
+            local row=report.byName[name]
+            row.excluded=build.excluded[name]==true
+            row.owned=inventory[name] or 0
+            row.required=row.excluded and 0 or math.max(0,row.total-row.placed)
+            row.missing=math.max(0,row.required-row.owned)
+            if row.excluded then report.skipped=report.skipped+row.total
+            else
+                report.total=report.total+row.total
+                report.placed=report.placed+row.placed
+                report.shortage=report.shortage+row.missing
+                if row.missing>0 then report.shortTypes=report.shortTypes+1 end
+            end
+        end
+    end
+    local function setBlockExcluded(name,excluded)
+        build.excluded[name]=excluded and true or nil
+        if build.lastBuild then
+            build.lastBuild.excluded=copyExclusions()
+            if persistLastBuild then persistLastBuild() end
+        end
+        paintPreviewFilters()
+        if build.bom then pcall(samplePlaced,build.bom) end
+        renderBOM()
+        status(name..(excluded and " skipped: its pending placements are cancelled." or " enabled for placement.")
+            ..(build.busy and " Already-sent requests may still finish." or ""))
+    end
+    renderBOM=function()
+        for _,button in pairs(bomButtons) do button.Visible=false end
         local report=build.bom
+        bomBuild.Visible=build.review~=nil and not build.busy
         if not report then
             bomProgress.Text="No blocks selected"
-            bomCurrent.Text="Load/clone a build, or select corners and hold a block."
-            bomNote.Text=""
-            bomRows.Text=""
+            bomCurrent.Text="Load a build, then click BUILD HERE to review materials."
+            bomNote.Text="";bomScroll.CanvasSize=UDim2.fromOffset(0,0)
             return
         end
-        bomProgress.Text=report.started and ("Placed: "..report.placed.." / "..report.total) or ("Total: "..report.total.." blocks")
+        measureBOM(report)
+        bomProgress.Text=report.started and ("Placed: "..report.placed.." / "..report.total)
+            or ("Enabled: "..report.total.." / "..report.fullTotal.." blocks")
         bomCurrent.Text=report.phase..(report.currentName and (": "..report.currentName) or "")
-        bomNote.Text=report.started and ("Verified in the island • "..report.sent.." requests sent"
-            ..(report.existing>0 and ("\nIncludes "..report.existing.." already present") or "")) or "Materials required"
-        local rows={}
-        for _, name in ipairs(report.names) do
+        bomNote.Text="Missing inventory: "..report.shortage.." • Skipped: "..report.skipped.."\nClick a material to grey it out or restore it."
+        bomBuild.Text=report.shortage>0 and ("Build Anyway ("..report.shortage.." Missing)") or "Build Enabled Blocks"
+        for index,name in ipairs(report.names) do
             local row=report.byName[name]
-            table.insert(rows,name.."  "..(report.started and (row.placed.." / "..row.total) or ("× "..row.total)))
+            local button=bomButtons[name]
+            if not button then
+                button=Instance.new("TextButton")
+                button.Name="Material_"..name
+                button.Size=UDim2.new(1,-8,0,62)
+                button.BorderSizePixel=0
+                button.Font,button.TextSize=Enum.Font.Gotham,12
+                button.TextWrapped=true
+                button.TextXAlignment=Enum.TextXAlignment.Left
+                local padding=Instance.new("UIPadding")
+                padding.PaddingLeft,padding.PaddingRight=UDim.new(0,9),UDim.new(0,9)
+                padding.Parent=button
+                local corner=Instance.new("UICorner")
+                corner.CornerRadius=UDim.new(0,7);corner.Parent=button
+                button.Parent=bomScroll;bomButtons[name]=button
+                connect(button.MouseButton1Click,function() setBlockExcluded(name,not build.excluded[name]) end)
+            end
+            button.Position=UDim2.fromOffset(0,(index-1)*68)
+            button.Visible=true
+            button.BackgroundColor3=row.excluded and Color3.fromRGB(232,232,236) or Color3.fromRGB(255,246,250)
+            button.TextColor3=row.excluded and Color3.fromRGB(133,133,141)
+                or (row.missing>0 and Color3.fromRGB(171,59,79) or Color3.fromRGB(53,42,49))
+            if row.excluded then
+                button.Text="[SKIP] "..name.."\nGreyed out × "..row.total.." • Have "..row.owned
+            else
+                button.Text="[ON] "..name..(report.started and ("  "..row.placed.."/"..row.total) or (" × "..row.total))
+                    .."\nNeed "..row.required.." • Have "..row.owned.." • Missing "..row.missing
+            end
         end
-        bomRows.Text=table.concat(rows,"\n")
-        bomRows.Size=UDim2.new(1,-8,0,math.max(24,#rows*23))
-        bomScroll.CanvasSize=UDim2.fromOffset(0,#rows*23)
+        bomScroll.CanvasSize=UDim2.fromOffset(0,#report.names*68)
     end
-    local function refreshPreviewBOM()
-        if not build.busy then build.bom=newBOM(build.records);renderBOM() end
-    end
-    local function placementKey(position, name)
+    local function placementKey(position,name)
         return string.format("%.1f,%.1f,%.1f:%s",position.X,position.Y,position.Z,name)
     end
-    local function samplePlaced(report)
+    samplePlaced=function(report)
         local blocks=ownBlocks()
         local available={}
-        for _, block in ipairs(blocks:GetChildren()) do
+        for _,block in ipairs(blocks:GetChildren()) do
             local part=blockPart(block)
             if part then
                 local key=placementKey(part.Position,block.Name)
@@ -2214,19 +2349,37 @@ local function installAutoBuild()
         end
         report.placed=0
         local missing={}
-        for _, row in pairs(report.byName) do row.placed=0 end
-        for _, record in ipairs(report.records) do
+        for _,row in pairs(report.byName) do row.placed=0 end
+        for _,record in ipairs(report.records) do
             local key=placementKey(record.cf.Position,record.name)
             if (available[key] or 0)>0 then
                 available[key]=available[key]-1
-                report.placed=report.placed+1
                 report.byName[record.name].placed=report.byName[record.name].placed+1
-            else
-                table.insert(missing,record)
-            end
+                if blockEnabled(record) then report.placed=report.placed+1 end
+            elseif blockEnabled(record) then table.insert(missing,record) end
         end
+        measureBOM(report)
         return missing
     end
+    local function refreshPreviewBOM()
+        build.review=nil
+        paintPreviewFilters()
+        if not build.busy then
+            build.bom=newBOM(build.records)
+            if #build.records>0 then pcall(samplePlaced,build.bom) end
+            renderBOM()
+        end
+    end
+    connect(bomEnableAll.MouseButton1Click,function()
+        build.excluded={}
+        if build.lastBuild then
+            build.lastBuild.excluded={}
+            if persistLastBuild then persistLastBuild() end
+        end
+        paintPreviewFilters()
+        if build.bom then pcall(samplePlaced,build.bom) end
+        renderBOM()
+    end)
     local function bounds()
         assert(build.first and build.last, "Set both selection corners first.")
         local a, b = build.first, build.last
@@ -2567,18 +2720,24 @@ local function installAutoBuild()
         end
         return copied
     end
-    local function rememberBuild(records)
-        local blocks=ownBlocks()
-        build.lastBuild={records=copyRecords(records),island=blocks.Parent.Name,placeId=game.PlaceId}
+    persistLastBuild=function()
+        local saved=build.lastBuild
+        if not saved then return end
         if type(writefile)=="function" and type(isfolder)=="function" and type(makefolder)=="function" then
             local ok,err=pcall(function()
                 if not isfolder("RoSnipe") then makefolder("RoSnipe") end
-                writefile(LAST_BUILD_PATH,HttpService:JSONEncode({Version=1,PlaceId=game.PlaceId,Island=blocks.Parent.Name,Build=serialize(records)}))
+                writefile(LAST_BUILD_PATH,HttpService:JSONEncode({Version=2,PlaceId=saved.placeId,
+                    Island=saved.island,Build=serialize(saved.records),Excluded=copyExclusions(saved.excluded or {})}))
             end)
-            if not ok then trace("Continue Last Build: memory only",err) end
+            if not ok then trace("Continue Last Build","Save failed: "..tostring(err)) end
         else
             trace("Continue Last Build","Saved for this session only; file APIs unavailable.")
         end
+    end
+    local function rememberBuild(records)
+        local blocks=ownBlocks()
+        build.lastBuild={records=copyRecords(records),island=blocks.Parent.Name,placeId=game.PlaceId,excluded=copyExclusions()}
+        persistLastBuild()
     end
     local function lastBuildRecords()
         if not build.lastBuild then
@@ -2587,10 +2746,12 @@ local function installAutoBuild()
             assert(#text<=10*1024*1024,"Last build data exceeds 10 MB.")
             local data=HttpService:JSONDecode(text)
             assert(type(data)=="table" and not data.Cleared and data.Build,"No saved last build.")
-            build.lastBuild={records=deserialize(data.Build),island=data.Island,placeId=data.PlaceId}
+            build.lastBuild={records=deserialize(data.Build),island=data.Island,placeId=data.PlaceId,excluded=copyExclusions(data.Excluded or {})}
         end
         assert(build.lastBuild.placeId==game.PlaceId,"Last build belongs to a different game place.")
         assert(ownBlocks().Parent.Name==build.lastBuild.island,"Return to the island where the last build started.")
+        build.excluded=copyExclusions(build.lastBuild.excluded or {})
+        paintPreviewFilters()
         return copyRecords(build.lastBuild.records)
     end
     local function clearLastBuild()
@@ -2666,7 +2827,7 @@ local function installAutoBuild()
                         if not waitReady() then return end
                         -- Never move the character from a worker. Re-group an
                         -- unsent block if the character drifted outside reach.
-                        if (root.Position-entry.record.cf.Position).Magnitude>28 then return end
+                        if not blockEnabled(entry.record) or (root.Position-entry.record.cf.Position).Magnitude>28 then return end
                         call.sentAt=os.clock()
                         entry.sent=true
                         onSent(entry.record)
@@ -2716,7 +2877,13 @@ local function installAutoBuild()
             assert(tool,instant and "Greg's Hammer was not found in your inventory. Use Destroy Blocks [Beta] with a pickaxe."
                 or "No pickaxe found in your character or Backpack. Put a pickaxe in your hotbar, then retry.")
         end
-        if kind=="place" then rememberBuild(records) end
+        if kind=="place" then
+            local enabled=0
+            for _,record in ipairs(records) do if blockEnabled(record) then enabled=enabled+1 end end
+            assert(enabled>0,"All block types are greyed out. Enable a material in Blocks first.")
+            rememberBuild(records)
+            build.review=nil
+        end
         stopFarms()
         if kind~="place" then
             if tool.Parent~=character then humanoid:EquipTool(tool) end
@@ -2782,7 +2949,7 @@ local function installAutoBuild()
             elseif frozen then frozen:Destroy();frozen=nil end
         end
         local function ensureReach(record)
-            if not waitReady() then return false end
+            if not waitReady() or (kind=="place" and not blockEnabled(record)) then return false end
             local distance=(root.Position-record.cf.Position).Magnitude
             if distance<=24 or (not canMove() and distance<=30) then
                 if canMove() then
@@ -2801,7 +2968,7 @@ local function installAutoBuild()
             -- Small steps avoid a single long jump to a distant schematic cell.
             -- Progress uses observed positions after each physics step.
             while activeTime<travelLimit do
-                if not waitReady() then return false end
+                if not waitReady() or (kind=="place" and not blockEnabled(record)) then return false end
                 assert(canMove(),"Build movement disabled while travelling. Enable Auto Reach Floating Blocks or Move To Build Position.")
                 syncMovement()
                 local delta=destination-root.Position
@@ -2885,7 +3052,8 @@ local function installAutoBuild()
                         -- The pass is sorted bottom-up; keep that order inside
                         -- each local group so lower blocks are dispatched first.
                         for index,record in ipairs(remaining) do
-                            if record then
+                            if record and not blockEnabled(record) then remaining[index]=false end
+                            if record and blockEnabled(record) then
                                 local distance=(record.cf.Position-center).Magnitude
                                 if distance<nearestDistance then nearest,nearestDistance=record,distance end
                                 if distance<=28 and #entries<64 then
@@ -2895,7 +3063,10 @@ local function installAutoBuild()
                         end
                         if not nearest then return end
                         if #entries==0 then
-                            if not ensureReach(nearest) then return end
+                            if not ensureReach(nearest) then
+                                if not blockEnabled(nearest) then continue end
+                                return
+                            end
                         else
                             -- Hold this spot until all calls for the group end.
                             if canMove() then
@@ -2927,6 +3098,7 @@ local function installAutoBuild()
                     else
                         for index,record in ipairs(queue) do
                             if not waitReady() then break end
+                            if kind=="place" and not blockEnabled(record) then continue end
                             if kind~="place" then assert(tool.Parent==character,"Building tool changed; job stopped.") end
                             if report then
                                 report.phase,report.currentName=pass==1 and "Placing" or ("Retry "..(pass-1)),record.name
@@ -2934,8 +3106,11 @@ local function installAutoBuild()
                             end
                             if kind=="place" then
                                 local sent,accepted=invoke(placeRemote,{[placeKey]=placeHash,cframe=record.cf,blockType=record.name,upperBlock=record.upperBlock==true},current,waitReady,
-                                    function() return ensureReach(record) end)
-                                if not sent then break end
+                                    function() return blockEnabled(record) and ensureReach(record) and blockEnabled(record) end)
+                                if not sent then
+                                    if not current() then break end
+                                    continue
+                                end
                                 requests=requests+1;report.sent=requests
                                 if not accepted then trace("placement rejected",record.name.."; will recheck on the next pass") end
                                 renderBOM()
@@ -2996,6 +3171,27 @@ local function installAutoBuild()
                 trace("job error",err);status((kind=="place" and "Build error: " or "Destroy error: ")..tostring(err))
             end
         end)
+    end
+    local function reviewBuild(records,missingOnly)
+        ensureIdle()
+        assert(#records>0 and #records<=MAX_BLOCKS,"Load a ghost preview or select 1–20000 blocks first.")
+        local report=newBOM(records)
+        build.bom=report
+        report.phase="Review materials before building"
+        bomGui.Enabled=true
+        local ok,err=pcall(samplePlaced,report)
+        build.review=ok and {records=records,missingOnly=missingOnly} or nil
+        renderBOM()
+        if not ok then error(tostring(err),0) end
+        status("Materials check: "..report.total.." enabled, "..report.skipped.." skipped, "..report.shortage
+            .." missing from inventory. Click rows to grey out unwanted types, then press the build button in Blocks.")
+    end
+    beginReviewedBuild=function()
+        local review=build.review
+        assert(review,"Click BUILD HERE or PLACE MISSING to review materials first.")
+        ensureIdle()
+        assert(#samplePlaced(build.bom)>0 or build.bom.total>0,"All block types are greyed out. Click a row or Enable All to restore them.")
+        startJob("place",copyRecords(review.records),false,review.missingOnly)
     end
     local function action(section, title, fn)
         table.insert(build.actions, title)
@@ -3109,20 +3305,20 @@ local function installAutoBuild()
         if build.busy and build.bom then bomGui.Enabled=v elseif not v then bomGui.Enabled=false end
     end)
     toggle(controls,"BuildNoclip","Auto Noclip While Building","Stops your character from getting stuck while building.",true,function(v) build.noclip=v end)
-    action(controls,"BUILD HERE",function() startJob("place",copyRecords(build.records),false,false) end)
-    action(controls,"PLACE MISSING",function() startJob("place",copyRecords(build.records),false,true) end)
+    action(controls,"BUILD HERE",function() reviewBuild(copyRecords(build.records),false) end)
+    action(controls,"PLACE MISSING",function() reviewBuild(copyRecords(build.records),true) end)
     action(controls,"Pause / Resume Build",function()
         assert(build.busy,"No build is running.")
         build.paused=not build.paused
         if build.bom then build.bom.phase=build.paused and "Paused" or "Resuming";renderBOM() end
         status(build.paused and "Build paused. An already-sent request may finish." or "Build resumed.")
     end)
-    action(controls,"Continue Last Build",function() ensureIdle();startJob("place",lastBuildRecords(),false,true) end)
+    action(controls,"Continue Last Build",function() ensureIdle();reviewBuild(lastBuildRecords(),true) end)
     action(controls,"Clear Last Build Data",clearLastBuild)
     action(controls,"Stop Build",function() stop("Stopped. Continue Last Build can place the remaining blocks.") end)
     action(controls,"Blocks",function()
-        if not build.busy and (not build.bom or not build.bom.started) then refreshPreviewBOM() end
-        assert(build.bom and build.bom.total>0,"Load a ghost preview or use Check Blocks in File first.")
+        if not build.busy and not build.review and (not build.bom or not build.bom.started) then refreshPreviewBOM() end
+        assert(build.bom and #build.bom.records>0,"Load a ghost preview or use Check Blocks in File first.")
         bomGui.Enabled=not bomGui.Enabled
         renderBOM()
     end)
@@ -3168,7 +3364,7 @@ local function installAutoBuild()
     toggle(rotations,"BuildLoadNearPlayer","Load Preview Near Me","Disable to retain the file's saved coordinates.",true,function(v) build.loadNearPlayer=v end)
     toggle(rotations,"BuildPreviewCollision","Build Collision (Preview)",nil,false,function(v)
         build.collision=v
-        for _,record in ipairs(build.records) do record.preview.CanCollide=v end
+        paintPreviewFilters()
     end)
 
     local selection=BuildFiles:AddSection("SELECTION")
@@ -3240,6 +3436,7 @@ local function installAutoBuild()
     action(files,"Select Build File",function() refreshFiles();fileDropdown:Open() end)
     action(files,"Check Blocks in File",function()
         ensureIdle()
+        build.review=nil
         build.bom=newBOM(readSelectedFile())
         build.bom.phase="Materials in "..build.file
         bomGui.Enabled=true
@@ -3261,7 +3458,7 @@ local function installAutoBuild()
         for y=low.Y,high.Y,3 do for x=low.X,high.X,3 do for z=low.Z,high.Z,3 do
             table.insert(records,{name=name,cf=CFrame.new(x,y,z)})
         end end end
-        startJob("place",records,false,false)
+        reviewBuild(records,false)
     end)
     action(tools,"Refresh Build Hash",function() ensureIdle();placeRemote,placeKey,placeHash=nil,nil,nil;resolvePlacement() end)
     action(tools,"Save Build Diagnostic",saveDiagnostic)
