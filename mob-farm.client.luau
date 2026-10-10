@@ -86,7 +86,6 @@ local stopChestPickup
 local stopFarming, resolveCropPlacement
 local stopBossFarm, runBossOnce, setBossStatus
 local stopTotemUpgrade
-local stopSteelPressMolds
 local stopAirWalk
 local stopCratePackerRecorder
 local generation = 0
@@ -1753,177 +1752,6 @@ local function installTotemUpgrade()
     end)
 end
 installTotemUpgrade()
-
--- Standard worker deposit payload from Ashlux's public machine module.
-local function installSteelPressMolds()
-    local section=Auto:AddSection("Steel Press")
-    local status=Auto:AddParagraph({Title="Steel Press Status",Content="Off. Keep moldPlate in your inventory and walk near empty steelPress machines."})
-    local toggle=section:AddToggle("AutoSteelPressPlateMolds",{Title="Auto Insert Plate Molds",Default=false,
-        Description="Deposits one moldPlate into nearby steelPress machines on your island."})
-    local active,changing,version=false,false,0
-    local range,confirmed=20,0
-    local pending
-    local completed=setmetatable({}, {__mode="k"})
-    local cooldown=setmetatable({}, {__mode="k"})
-    local function message(text)
-        if state.running then status:SetDesc(text) end
-    end
-    local function ownBlocks()
-        local islands=workspace:FindFirstChild("Islands")
-        for _,island in ipairs(islands and islands:GetChildren() or {}) do
-            local owners=island:FindFirstChild("Owners")
-            if owners and owners:FindFirstChild(tostring(LocalPlayer.UserId)) then return island:FindFirstChild("Blocks") end
-        end
-    end
-    local function partOf(block)
-        if block:IsA("BasePart") then return block end
-        if block:IsA("Model") and block.PrimaryPart then return block.PrimaryPart end
-        return block:FindFirstChildWhichIsA("BasePart",true)
-    end
-    local function moldCount()
-        local count,seen=0,{}
-        for _,container in pairs({LocalPlayer:FindFirstChild("Backpack"),LocalPlayer.Character}) do
-            if container then
-                for _,tool in ipairs(container:GetChildren()) do
-                    if tool:IsA("Tool") and tool.Name=="moldPlate" and not seen[tool] then
-                        seen[tool]=true
-                        local amount=tool:FindFirstChild("Amount")
-                        count=count+math.max(0,tonumber(amount and amount.Value) or 1)
-                    end
-                end
-            end
-        end
-        return count
-    end
-    local function moldValuePresent(value)
-        if value==nil or value=="" or value==false or value==0 then return false end
-        if type(value)=="string" then
-            local empty={none=true,empty=true,["nil"]=true,null=true,["0"]=true}
-            if empty[value:lower()] then return false end
-        end
-        return true
-    end
-    local function moldState(block)
-        local occupied=false
-        local function plate(value)
-            return type(value)=="string" and (value:lower()=="moldplate" or value:lower()=="plate")
-        end
-        for name,value in pairs(block:GetAttributes()) do
-            if name:lower():find("mold",1,true) and moldValuePresent(value) then
-                if plate(value) then return "plate" end
-                occupied=true
-            end
-        end
-        for _,child in ipairs(block:GetDescendants()) do
-            if child:IsA("Tool") and child.Name:lower():sub(1,4)=="mold" then
-                if child.Name=="moldPlate" then return "plate" end
-                occupied=true
-            end
-            if child:IsA("ValueBase") and child.Name:lower():find("mold",1,true) then
-                local value=child.Value
-                if moldValuePresent(value) then
-                    if plate(value) then return "plate" end
-                    occupied=true
-                end
-            end
-        end
-        return occupied and "occupied" or "empty or unreadable"
-    end
-    stopSteelPressMolds=function(reason)
-        active=false;version=version+1
-        if toggle.Value then changing=true;toggle:SetValue(false);changing=false end
-        if reason then message(reason) end
-    end
-    toggle:OnChanged(function(value)
-        if changing then return end
-        active=value;version=version+1
-        message(value and "Scanning nearby steelPress machines for empty mold slots..." or "Off.")
-    end)
-    section:AddSlider("SteelPressMoldRange",{Title="Steel Press Range",Default=20,Min=1,Max=24,Rounding=0,
-        Callback=function(value) range=tonumber(value) or range end})
-    local function runOnce()
-        -- A late reply must be reconciled before another mold can be deposited.
-        if pending and pending.done and pending.sent and not pending.checked then
-            pending.checked=true
-            local result=pending.result
-            local accepted=pending.ok and result~=false
-                and not (type(result)=="table" and (result.success==false or result.ok==false))
-            if accepted and pending.block.Parent==pending.blocks and not completed[pending.block]
-                and (moldState(pending.block)=="plate" or moldCount()<pending.before) then
-                completed[pending.block]=true;confirmed=confirmed+1
-            end
-        end
-        if pending and not pending.done then message("Waiting for the previous press request. No extra request sent.");return end
-        local character,humanoid,root=getCharacter()
-        if not root then message("Waiting for your character.");return end
-        local blocks=ownBlocks()
-        if not blocks then message("Your island's blocks are not loaded.");return end
-        if moldCount()<1 then message("Waiting for moldPlate in your hotbar or Backpack.");return end
-        local chosen,part,nearest=nil,nil,range
-        for _,block in ipairs(blocks:GetChildren()) do
-            if block.Name=="steelPress" and not completed[block] and (cooldown[block] or 0)<=os.clock()
-                and moldState(block)=="empty or unreadable" then
-                local candidate=partOf(block)
-                local distance=candidate and (candidate.Position-root.Position).Magnitude
-                if distance and distance<=nearest then chosen,part,nearest=block,candidate,distance end
-            end
-        end
-        if not chosen then message("No empty steelPress within "..range.." studs. Confirmed transfers: "..confirmed..".");return end
-        local remote=netManaged():FindFirstChild("CLIENT_BLOCK_WORKER_DEPOSIT_TOOL_REQUEST")
-        assert(remote and remote:IsA("RemoteFunction"),"Machine deposit RemoteFunction not found.")
-        local token=version
-        local function current()
-            return state.running and active and token==version and LocalPlayer.Character==character and humanoid.Health>0
-        end
-        local before=moldCount()
-        local request={done=false,block=chosen,blocks=blocks,before=before};pending=request
-        message("Putting one moldPlate into steelPress...")
-        task.spawn(function()
-            if not current() or chosen.Parent~=blocks or not part.Parent
-                or (part.Position-root.Position).Magnitude>range or moldState(chosen)~="empty or unreadable" then
-                request.cancelled=true;request.done=true;return
-            end
-            request.sent=true
-            request.ok,request.result=pcall(function()
-                return remote:InvokeServer({amount=1,block=chosen,toolName="moldPlate",player_tracking_category="join_from_web"})
-            end)
-            request.done=true
-        end)
-        local deadline=os.clock()+8
-        while current() and not request.done and os.clock()<deadline do task.wait(0.05) end
-        if not current() or request.cancelled then return end
-        if not request.done then message("Press request is still pending. Waiting before sending anything else.");return end
-        local result=request.result
-        local rejected=not request.ok or result==false or (type(result)=="table" and (result.success==false or result.ok==false))
-        if not rejected then
-            deadline=os.clock()+2
-            repeat
-                if not current() or chosen.Parent~=blocks then return end
-                if moldState(chosen)=="plate" or moldCount()<before then
-                    completed[chosen]=true;request.checked=true;confirmed=confirmed+1
-                    message("Confirmed moldPlate transfer to steelPress. This session: "..confirmed..".")
-                    return
-                end
-                task.wait(0.1)
-            until os.clock()>=deadline
-        end
-        request.checked=true
-        cooldown[chosen]=os.clock()+5
-        message(rejected and "Machine deposit rejected. A separate mold-insert remote may be needed. Retrying other nearby presses."
-            or "No mold transfer confirmed. A separate mold-insert remote may be needed; this press will retry after 5s.")
-    end
-    task.spawn(function()
-        while state.running do
-            if active then
-                local ok,err=pcall(runOnce)
-                if not ok then message("Steel press error: "..tostring(err)) end
-            end
-            task.wait(0.5)
-        end
-    end)
-end
-installSteelPressMolds()
-
 
 -- Capture the game's normal recipe selection before implementing a bulk changer.
 -- No guessed recipe IDs, replay, or remote requests are made by this recorder.
@@ -4303,7 +4131,6 @@ installAirWalk()
 
 local function shutdown()
     if not state.running then return end
-    if stopSteelPressMolds then stopSteelPressMolds("Hub unloaded.") end
     if stopAirWalk then stopAirWalk("Hub unloaded.") end
     if stopCratePackerRecorder then stopCratePackerRecorder("Hub unloaded.") end
     if stopChestPickup then stopChestPickup(true) end
@@ -4334,7 +4161,6 @@ table.insert(connections, UserInputService.WindowFocused:Connect(function()
     windowFocused = true
 end))
 table.insert(connections, LocalPlayer.CharacterRemoving:Connect(function()
-    if stopSteelPressMolds then stopSteelPressMolds("Stopped: character respawning.") end
     if stopAirWalk then stopAirWalk("Stopped: character respawning.") end
     if stopCratePackerRecorder then stopCratePackerRecorder("Character respawning.") end
     if stopBossFarm then stopBossFarm("Stopped: character respawning.") end
