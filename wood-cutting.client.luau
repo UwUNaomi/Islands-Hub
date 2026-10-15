@@ -1,5 +1,5 @@
 -- Standalone wood cutting, extracted from mob-farm.client.luau's Tree Aura.
--- Starts enabled. Only hits nearby trees; never moves the character or camera.
+-- Starts enabled. Hits nearby trees and holds D while your character is alive.
 -- Requires the same executor APIs as the hub. Server reach/cooldowns still apply.
 -- Stop: getgenv().IslandsWoodCutting.Stop()
 local TREE_TYPE = "All" -- All, Oak, Birch, Maple, Pine, Hickory, Spirit, CherryBlossom, Apple, Lemon
@@ -9,6 +9,8 @@ local HIT_INTERVAL = 0.1 -- lowest supported interval; seconds after each comple
 if not game:IsLoaded() then game.Loaded:Wait() end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 assert(LocalPlayer, "Run wood cutting on the client.")
 
@@ -27,11 +29,40 @@ local state = {
     status = "Starting wood cutting...",
 }
 environment.IslandsWoodCutting = state
-local characterConnection
+local characterConnection, inputConnection
+local keyInput, keyHeld, heldCharacter, lastInputError
+local function setDDown(down)
+    if down == (keyHeld == true) then return true end
+    local ok, err = pcall(function()
+        if not keyInput then
+            local created, input = pcall(function() return UserInputService:CreateVirtualInput() end)
+            if created and input then
+                keyInput = function(pressed) input:SendKey(pressed, Enum.KeyCode.D, false) end
+            else
+                local manager = game:GetService("VirtualInputManager")
+                keyInput = function(pressed) manager:SendKeyEvent(pressed, Enum.KeyCode.D, false, game) end
+            end
+        end
+        keyInput(down)
+    end)
+    if ok then
+        keyHeld = down
+        lastInputError = nil
+    elseif tostring(err) ~= lastInputError then
+        lastInputError = tostring(err)
+        warn("[Wood Cutting] Could not " .. (down and "hold" or "release") .. " D: " .. lastInputError)
+    end
+    return ok
+end
 function state.Stop()
     state.running = false
     state.treeTarget = nil
     state.status = "Off"
+    setDDown(false)
+    if inputConnection then
+        inputConnection:Disconnect()
+        inputConnection = nil
+    end
     if characterConnection then
         characterConnection:Disconnect()
         characterConnection = nil
@@ -279,9 +310,27 @@ assert(treePatterns[state.treeType], "Unknown TREE_TYPE: " .. tostring(state.tre
 assert(type(RANGE) == "number" and RANGE > 0, "RANGE must be positive.")
 assert(type(HIT_INTERVAL) == "number" and HIT_INTERVAL >= 0.1, "HIT_INTERVAL must be at least 0.1 seconds.")
 characterConnection = LocalPlayer.CharacterAdded:Connect(function()
+    setDDown(false)
+    heldCharacter = nil
     state.treeTarget = nil
     treeRemote, treeHashKey, treeHashValue = nil, nil, nil
 end)
+
+local function syncDHold()
+    if not state.running or environment.IslandsWoodCutting ~= state then
+        state.Stop()
+        return
+    end
+    local character = getCharacter()
+    if heldCharacter ~= character then
+        if not setDDown(false) then return end
+        heldCharacter = character
+    end
+    -- Release while dead or typing; retry once the character/input is ready.
+    setDDown(character ~= nil and UserInputService:GetFocusedTextBox() == nil)
+end
+inputConnection = RunService.Heartbeat:Connect(syncDHold)
+syncDHold()
 
 setTreeStatus("Enabled: scanning nearby " .. state.treeType .. " trees; axe detection is automatic.")
 task.spawn(function()
