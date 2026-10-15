@@ -6,6 +6,7 @@ local TREE_TYPE = "All" -- All, Oak, Birch, Maple, Pine, Hickory, Spirit, Cherry
 local RANGE = 29 -- studs
 local HIT_INTERVAL = 0.1 -- lowest supported interval; seconds after each completed request
 
+print("[Wood Cutting] Script received; waiting for the game to load.")
 if not game:IsLoaded() then game.Loaded:Wait() end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -16,28 +17,34 @@ assert(LocalPlayer, "Run wood cutting on the client.")
 
 local environment = getgenv and getgenv() or _G
 local previous = environment.IslandsWoodCutting
+local inheritedRequest
 if type(previous) == "table" and type(previous.Stop) == "function" then
-    previous.Stop()
-    assert(not previous.pendingTreeHit or previous.pendingTreeHit.done,
-        "The previous wood-cutting hit is still pending. Wait for it to finish before executing again.")
+    previous.running = false
+    local stopped, stopError = pcall(previous.Stop)
+    if not stopped then warn("[Wood Cutting] Previous movement cleanup failed: " .. tostring(stopError)) end
+    inheritedRequest = previous.pendingTreeHit
 end
 local state = {
     running = true,
     treeType = TREE_TYPE,
     treeRange = RANGE,
     treeInterval = HIT_INTERVAL,
+    pendingTreeHit = inheritedRequest,
     status = "Starting wood cutting...",
 }
 environment.IslandsWoodCutting = state
+print("[Wood Cutting] Loaded startup recovery update (29 studs / 0.1 seconds).")
 local characterConnection, movementConnection, focusLostConnection, focusGainedConnection
 local movedHumanoid
 local windowFocused = true
 local RIGHT_DIRECTION = Vector3.new(1, 0, 0)
 local function stopMovement()
-    if movedHumanoid and movedHumanoid.Parent then
-        movedHumanoid:Move(Vector3.zero, false)
-    end
+    local humanoid = movedHumanoid
     movedHumanoid = nil
+    if humanoid and humanoid.Parent then
+        local ok, err = pcall(function() humanoid:Move(Vector3.zero, false) end)
+        if not ok then warn("[Wood Cutting] Movement cleanup: " .. tostring(err)) end
+    end
 end
 function state.Stop()
     state.running = false
@@ -327,32 +334,58 @@ local function syncRightMovement()
     -- No key-down cache or render callback: focus loss cannot clear this command.
     humanoid:Move(RIGHT_DIRECTION, true)
 end
-focusLostConnection = UserInputService.WindowFocusReleased:Connect(function()
-    windowFocused = false
-    syncRightMovement()
-end)
-focusGainedConnection = UserInputService.WindowFocused:Connect(function()
-    windowFocused = true
-    syncRightMovement()
-end)
-movementConnection = RunService.PreSimulation:Connect(syncRightMovement)
-syncRightMovement()
+local lastMovementError
+local function updateMovement()
+    local ok, err = pcall(syncRightMovement)
+    if not ok then
+        state.movementStatus = "Movement error: " .. tostring(err)
+        if state.movementStatus ~= lastMovementError then
+            lastMovementError = state.movementStatus
+            warn("[Wood Cutting] " .. lastMovementError .. "; cutting remains enabled.")
+        end
+    else
+        lastMovementError = nil
+        state.movementStatus = movedHumanoid and "Walking right" or "Waiting for character or text input"
+    end
+end
 
-setTreeStatus("Enabled: scanning nearby " .. state.treeType .. " trees; axe detection is automatic.")
+-- Cutting starts independently, even if this executor rejects movement APIs.
 task.spawn(function()
     while state.running and environment.IslandsWoodCutting == state do
-        -- A respawn must not queue another hit while the old request is pending.
-        if not state.pendingTreeHit or state.pendingTreeHit.done then
+        local delay = state.treeInterval
+        if state.pendingTreeHit and not state.pendingTreeHit.done then
+            setTreeStatus("Waiting for the pending server hit; cutting will resume when it returns.")
+        else
             local ok, err = pcall(runTreeOnce)
             if not ok and state.running then
-                setTreeStatus("Stopped: " .. tostring(err))
-                local message = state.status
-                state.Stop()
-                state.status = message
-                warn("[Wood Cutting] " .. message)
+                state.lastError = tostring(err)
+                setTreeStatus("Cutting error: " .. state.lastError .. " Retrying in 2 seconds.")
+                treeRemote, treeHashKey, treeHashValue = nil, nil, nil
+                state.treeTarget = nil
+                delay = 2
             end
         end
-        if state.running then task.wait(state.treeInterval) end
+        if state.running then task.wait(delay) end
     end
 end)
+
+local movementReady, movementError = pcall(function()
+    focusLostConnection = UserInputService.WindowFocusReleased:Connect(function()
+        windowFocused = false
+        updateMovement()
+    end)
+    focusGainedConnection = UserInputService.WindowFocused:Connect(function()
+        windowFocused = true
+        updateMovement()
+    end)
+    local supported, simulationEvent = pcall(function() return RunService.PreSimulation end)
+    local movementEvent = supported and simulationEvent or RunService.Heartbeat
+    movementConnection = movementEvent:Connect(updateMovement)
+    updateMovement()
+end)
+if not movementReady then
+    state.movementStatus = "Movement setup failed: " .. tostring(movementError)
+    warn("[Wood Cutting] " .. state.movementStatus .. "; cutting remains enabled.")
+end
+
 return state
