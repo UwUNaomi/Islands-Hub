@@ -3,8 +3,8 @@
 -- Requires the same executor APIs as the hub. Server reach/cooldowns still apply.
 -- Stop: getgenv().IslandsWoodCutting.Stop()
 local TREE_TYPE = "All" -- All, Oak, Birch, Maple, Pine, Hickory, Spirit, CherryBlossom, Apple, Lemon
-local RANGE = 12 -- studs; matches the hub's default
-local HIT_INTERVAL = 0.5 -- seconds after each completed request
+local RANGE = 29 -- studs
+local HIT_INTERVAL = 0.1 -- lowest supported interval; seconds after each completed request
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 local Players = game:GetService("Players")
